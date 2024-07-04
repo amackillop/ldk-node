@@ -36,6 +36,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;
 
 use rand::{thread_rng, Rng};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use core::future::Future;
 use core::task::{Poll, Waker};
@@ -48,6 +50,7 @@ use std::time::Duration;
 ///
 /// [`Node`]: [`crate::Node`]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Event {
 	/// A sent payment was successful.
 	PaymentSuccessful {

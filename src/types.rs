@@ -21,6 +21,8 @@ use lightning_transaction_sync::EsploraSyncClient;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serializer, Serialize};
 
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -144,6 +146,7 @@ pub(crate) type BumpTransactionEventHandler =
 ///
 /// By default, this will be randomly generated for the user to ensure local uniqueness.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct UserChannelId(pub u128);
 
 impl Writeable for UserChannelId {
@@ -164,6 +167,7 @@ impl Readable for UserChannelId {
 ///
 /// [`Node::list_channels`]: crate::Node::list_channels
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ChannelDetails {
 	/// The channel ID (prior to funding transaction generation, this is a random 32-byte
 	/// identifier, afterwards this is the transaction ID of the funding transaction XOR the
@@ -339,6 +343,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 ///
 /// [`Node::list_peers`]: crate::Node::list_peers
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PeerDetails {
 	/// The node ID of the peer.
 	pub node_id: PublicKey,
@@ -448,5 +453,25 @@ impl From<ChannelConfig> for LdkChannelConfig {
 impl Default for ChannelConfig {
 	fn default() -> Self {
 		LdkChannelConfig::default().into()
+	}
+}
+#[cfg(feature = "serde")]
+impl Serialize for ChannelConfig {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		self.inner.read().unwrap().serialize(serializer)
+	}
+}
+
+#[cfg(feature = "serde")]
+impl<'a> Deserialize<'a> for ChannelConfig {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'a>,
+	{
+		let config = LdkChannelConfig::deserialize(deserializer)?;
+		Ok(Self::from(config))
 	}
 }

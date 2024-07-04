@@ -15,6 +15,8 @@ use lightning::{
 	_init_and_read_len_prefixed_tlv_fields, impl_writeable_tlv_based,
 	impl_writeable_tlv_based_enum, write_tlv_fields,
 };
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 use std::iter::FromIterator;
@@ -24,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Represents a payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PaymentDetails {
 	/// The identifier of this payment.
 	pub id: PaymentId,
@@ -133,6 +136,7 @@ impl Readable for PaymentDetails {
 
 /// Represents the direction of a payment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PaymentDirection {
 	/// The payment is inbound.
 	Inbound,
@@ -147,6 +151,7 @@ impl_writeable_tlv_based_enum!(PaymentDirection,
 
 /// Represents the current status of a payment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PaymentStatus {
 	/// The payment is still pending.
 	Pending,
@@ -164,6 +169,7 @@ impl_writeable_tlv_based_enum!(PaymentStatus,
 
 /// Represents the kind of a payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PaymentKind {
 	/// An on-chain payment.
 	Onchain,
@@ -270,6 +276,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 ///
 /// [`LdkChannelConfig::accept_underpaying_htlcs`]: lightning::util::config::ChannelConfig::accept_underpaying_htlcs
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LSPFeeLimits {
 	/// The maximal total amount we allow any configured LSP withhold from us when forwarding the
 	/// payment.

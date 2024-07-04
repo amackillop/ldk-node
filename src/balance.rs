@@ -6,11 +6,14 @@ use lightning::util::sweep::{OutputSpendStatus, TrackedSpendableOutput};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Txid};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Details of the known available balances returned by [`Node::list_balances`].
 ///
 /// [`Node::list_balances`]: crate::Node::list_balances
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BalanceDetails {
 	/// The total balance of our on-chain wallet.
 	pub total_onchain_balance_sats: u64,
@@ -61,6 +64,7 @@ pub struct BalanceDetails {
 
 /// Details about the status of a known Lightning balance.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum LightningBalance {
 	/// The channel is not yet closed (or the commitment or closing transaction has not yet
 	/// appeared in a block). The given balance is claimable (less on-chain fees) if the channel is
@@ -226,6 +230,7 @@ impl LightningBalance {
 
 /// Details about the status of a known balance currently being swept to our on-chain wallet.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum PendingSweepBalance {
 	/// The spendable output is about to be swept, but a spending transaction has yet to be generated and
 	/// broadcast.

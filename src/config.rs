@@ -6,6 +6,8 @@ use lightning::util::logger::Level as LogLevel;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 // Config defaults
 const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node/";
@@ -68,6 +70,7 @@ pub(crate) const RGS_SYNC_TIMEOUT_SECS: u64 = 5;
 pub(crate) const WALLET_KEYS_SEED_LEN: usize = 64;
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 /// Represents the configuration of an [`Node`] instance.
 ///
 /// ### Defaults
@@ -195,7 +198,8 @@ impl Default for Config {
 ///
 ///
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, )]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnchorChannelsConfig {
 	/// A list of peers that we trust to get the required channel closing transactions confirmed
 	/// on-chain.

@@ -109,6 +109,8 @@ pub use error::Error as NodeError;
 use error::Error;
 
 pub use event::Event;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 pub use types::ChannelConfig;
 
 pub use io::utils::generate_entropy_mnemonic;
@@ -1633,6 +1635,7 @@ impl Drop for Node {
 
 /// Represents the status of the [`Node`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct NodeStatus {
 	/// Indicates whether the [`Node`] is running.
 	pub is_running: bool,
