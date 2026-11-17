@@ -414,6 +414,8 @@ typedef string ScriptBuf;
 
 typedef enum Event;
 
+typedef enum PaymentReceiveFailureReason;
+
 typedef interface HRNResolverConfig;
 
 typedef dictionary HumanReadableNamesConfig;
