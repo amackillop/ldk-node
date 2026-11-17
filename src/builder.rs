@@ -342,6 +342,19 @@ pub struct NodeBuilder {
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
 	probing_config: Option<ProbingConfig>,
+	network_graph_capacity: Option<NetworkGraphCapacity>,
+}
+
+#[cfg(feature = "uniffi")]
+fn saturating(count: u64) -> usize {
+	usize::try_from(count).unwrap_or(usize::MAX)
+}
+
+/// Room to reserve in a new network graph, set with [`NodeBuilder::set_network_graph_capacity`].
+#[derive(Debug, Clone, Copy)]
+struct NetworkGraphCapacity {
+	nodes: usize,
+	channels: usize,
 }
 
 #[cfg(not(feature = "uniffi"))]
@@ -373,6 +386,7 @@ impl NodeBuilder {
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 			probing_config,
+			network_graph_capacity: None,
 		}
 	}
 
@@ -707,6 +721,16 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets the room a new network graph reserves for nodes and channels.
+	///
+	/// By default a graph that is not yet in the store reserves room for the whole public network
+	/// on mainnet, which a device with little memory cannot spare. A graph read back from the store
+	/// is sized from its contents either way.
+	pub fn set_network_graph_capacity(&mut self, nodes: usize, channels: usize) -> &mut Self {
+		self.network_graph_capacity = Some(NetworkGraphCapacity { nodes, channels });
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	#[cfg(feature = "storage-sqlite")]
@@ -977,6 +1001,7 @@ impl NodeBuilder {
 			self.liquidity_source_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.probing_config.as_ref(),
+			self.network_graph_capacity,
 			self.async_payments_role,
 			seed_bytes,
 			runtime,
@@ -1315,6 +1340,16 @@ impl Builder {
 	pub fn set_probing_config(&self, config: Arc<ProbingConfig>) {
 		self.inner.write().expect("lock").set_probing_config((*config).clone());
 	}
+
+	/// Sets the room a new network graph reserves for nodes and channels.
+	///
+	/// See [`NodeBuilder::set_network_graph_capacity`].
+	pub fn set_network_graph_capacity(&self, nodes: u64, channels: u64) {
+		self.inner
+			.write()
+			.expect("lock")
+			.set_network_graph_capacity(saturating(nodes), saturating(channels));
+	}
 }
 
 #[cfg(all(feature = "uniffi", feature = "storage-sqlite"))]
@@ -1528,8 +1563,9 @@ fn build_with_store_internal(
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
-	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
-	seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	probing_config: Option<&ProbingConfig>, network_graph_capacity: Option<NetworkGraphCapacity>,
+	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
+	logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -2070,7 +2106,14 @@ fn build_with_store_internal(
 		Ok(graph) => Arc::new(graph),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
-				Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+				let network = config.network.into();
+				let logger = Arc::clone(&logger);
+				Arc::new(match network_graph_capacity {
+					Some(NetworkGraphCapacity { nodes, channels }) => {
+						Graph::with_capacity(network, logger, nodes, channels)
+					},
+					None => Graph::new(network, logger),
+				})
 			} else {
 				log_error!(logger, "Failed to read network graph from store: {}", e);
 				return Err(BuildError::ReadFailed);
