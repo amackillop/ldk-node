@@ -7,7 +7,7 @@
 
 use core::future::Future;
 use core::task::{Poll, Waker};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
@@ -19,9 +19,9 @@ use lightning::events::bump_transaction::BumpTransactionEvent;
 #[cfg(not(feature = "uniffi"))]
 use lightning::events::PaidBolt12Invoice;
 use lightning::events::{
-	ClosureReason, Event as LdkEvent, FundingInfo, InboundHTLCLocator as LdkInboundHtlcLocator,
-	OutboundHTLCLocator as LdkOutboundHtlcLocator, PaymentFailureReason, PaymentPurpose,
-	ReplayEvent,
+	ClosureReason, Event as LdkEvent, FundingInfo, HTLCHandlingFailureType,
+	InboundHTLCLocator as LdkInboundHtlcLocator, OutboundHTLCLocator as LdkOutboundHtlcLocator,
+	PaymentFailureReason, PaymentPurpose, ReplayEvent,
 };
 use lightning::ln::channelmanager::{PaymentId, TrustedChannelFeatures};
 use lightning::ln::types::ChannelId;
@@ -173,6 +173,16 @@ pub enum Event {
 		amount_msat: u64,
 		/// Custom TLV records received on the payment
 		custom_records: Vec<CustomTlvRecord>,
+	},
+	/// An inbound payment was failed back to the payer instead of being claimed.
+	///
+	/// Emitted for each HTLC failed back. When LDK Node refuses a multi-part payment, the first
+	/// part carries the reason and later parts report [`PaymentReceiveFailureReason::Other`].
+	PaymentReceiveFailed {
+		/// The hash of the payment.
+		payment_hash: PaymentHash,
+		/// Why the payment was failed back.
+		reason: PaymentReceiveFailureReason,
 	},
 	/// A payment has been forwarded.
 	PaymentForwarded {
@@ -397,12 +407,60 @@ impl_writeable_tlv_based_enum!(Event,
 		(5, user_channel_id, required),
 		(7, new_funding_txo, required),
 	},
+	(10, PaymentReceiveFailed) => {
+		(0, payment_hash, required),
+		(2, reason, required),
+	},
 	(9, SpliceNegotiationFailed) => {
 		(1, channel_id, required),
 		(3, counterparty_node_id, required),
 		(5, user_channel_id, required),
 		// TLV 7 (abandoned_funding_txo) may be set for LDK Node v0.7.
 	},
+);
+
+/// Why an inbound payment was failed back, in [`Event::PaymentReceiveFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PaymentReceiveFailureReason {
+	/// The payment was for a payment this node itself sent; circular payments are unsupported.
+	CircularPayment,
+	/// A payment with the same hash was already received.
+	DuplicatePayment,
+	/// The counterparty withheld more than the LSPS2 opening fee the payment's invoice allows.
+	ExcessiveSkimmedFee {
+		/// The fee the counterparty withheld, in millisatoshis.
+		counterparty_skimmed_fee_msat: u64,
+		/// The most the invoice allows it to withhold, in millisatoshis.
+		max_total_opening_fee_msat: u64,
+	},
+	/// The counterparty withheld a fee from a payment whose invoice allows none.
+	UnexpectedSkimmedFee {
+		/// The fee the counterparty withheld, in millisatoshis.
+		counterparty_skimmed_fee_msat: u64,
+	},
+	/// The payment was to a BOLT11 payment hash this node does not know.
+	UnknownPaymentHash,
+	/// The payment could not be claimed because its preimage is unknown.
+	UnknownPreimage,
+	/// LDK failed the payment back itself, for instance on a multi-part payment timeout; its
+	/// reason is logged.
+	Other,
+}
+
+impl_writeable_tlv_based_enum!(PaymentReceiveFailureReason,
+	(0, CircularPayment) => {},
+	(2, DuplicatePayment) => {},
+	(4, ExcessiveSkimmedFee) => {
+		(0, counterparty_skimmed_fee_msat, required),
+		(2, max_total_opening_fee_msat, required),
+	},
+	(6, UnexpectedSkimmedFee) => {
+		(0, counterparty_skimmed_fee_msat, required),
+	},
+	(8, UnknownPaymentHash) => {},
+	(10, UnknownPreimage) => {},
+	(12, Other) => {},
 );
 
 pub struct EventQueue<L: Deref>
@@ -574,6 +632,8 @@ where
 	runtime: Arc<Runtime>,
 	logger: L,
 	config: Arc<Config>,
+	/// Why LDK Node refused an inbound payment, until LDK's `HTLCHandlingFailed` for it.
+	receive_failures: Mutex<HashMap<PaymentHash, PaymentReceiveFailureReason>>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -611,6 +671,7 @@ where
 			runtime,
 			logger,
 			config,
+			receive_failures: Mutex::new(HashMap::new()),
 		}
 	}
 
@@ -674,6 +735,14 @@ where
 				tokio::time::sleep(PEER_RECONNECTION_INTERVAL).await;
 			}
 		});
+	}
+
+	/// Records why LDK Node is about to fail an inbound payment back, for the
+	/// [`Event::PaymentReceiveFailed`] queued once LDK reports the failure.
+	fn record_receive_failure(
+		&self, payment_hash: PaymentHash, reason: PaymentReceiveFailureReason,
+	) {
+		self.receive_failures.lock().expect("lock").insert(payment_hash, reason);
 	}
 
 	async fn fail_claimable_payment(
@@ -858,6 +927,10 @@ where
 							"Refused inbound payment with ID {}: circular payments are unsupported.",
 							payment_id
 						);
+						self.record_receive_failure(
+							payment_hash,
+							PaymentReceiveFailureReason::CircularPayment,
+						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
 
 						let update = PaymentDetailsUpdate {
@@ -901,6 +974,10 @@ where
 							hex_utils::to_string(&payment_hash.0),
 							amount_msat,
 						);
+						self.record_receive_failure(
+							payment_hash,
+							PaymentReceiveFailureReason::DuplicatePayment,
+						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
 
 						let update = PaymentDetailsUpdate {
@@ -935,6 +1012,12 @@ where
 							hex_utils::to_string(&payment_hash.0),
 							counterparty_skimmed_fee_msat,
 						);
+						self.record_receive_failure(
+							payment_hash,
+							PaymentReceiveFailureReason::UnexpectedSkimmedFee {
+								counterparty_skimmed_fee_msat,
+							},
+						);
 						self.fail_claimable_payment(payment_id, &payment_hash).await?;
 						return Ok(());
 					};
@@ -946,6 +1029,13 @@ where
 							hex_utils::to_string(&payment_hash.0),
 							counterparty_skimmed_fee_msat,
 							max_total_opening_fee_msat,
+						);
+						self.record_receive_failure(
+							payment_hash,
+							PaymentReceiveFailureReason::ExcessiveSkimmedFee {
+								counterparty_skimmed_fee_msat,
+								max_total_opening_fee_msat,
+							},
 						);
 						self.fail_claimable_payment(payment_id, &payment_hash).await?;
 						return Ok(());
@@ -984,6 +1074,10 @@ where
 								"Refusing unknown BOLT11 payment with hash {} of {}msat",
 								hex_utils::to_string(&payment_hash.0),
 								amount_msat,
+							);
+							self.record_receive_failure(
+								payment_hash,
+								PaymentReceiveFailureReason::UnknownPaymentHash,
 							);
 							self.channel_manager.fail_htlc_backwards(&payment_hash);
 							return Ok(());
@@ -1229,6 +1323,10 @@ where
 						self.logger,
 						"Failed to claim payment with ID {}: preimage unknown.",
 						payment_id,
+					);
+					self.record_receive_failure(
+						payment_hash,
+						PaymentReceiveFailureReason::UnknownPreimage,
 					);
 					self.channel_manager.fail_htlc_backwards(&payment_hash);
 
@@ -1538,7 +1636,27 @@ where
 					prober.handle_background_probe_failed(&path, payment_id);
 				}
 			},
-			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
+			LdkEvent::HTLCHandlingFailed { failure_type, failure_reason, .. } => {
+				if let HTLCHandlingFailureType::Receive { payment_hash } = &failure_type {
+					let reason = self
+						.receive_failures
+						.lock()
+						.expect("lock")
+						.remove(payment_hash)
+						.unwrap_or(PaymentReceiveFailureReason::Other);
+					log_info!(
+						self.logger,
+						"Failed back inbound payment with hash {}: {:?} (LDK: {:?})",
+						hex_utils::to_string(&payment_hash.0),
+						reason,
+						failure_reason,
+					);
+					let event = Event::PaymentReceiveFailed { payment_hash: *payment_hash, reason };
+					if let Err(e) = self.event_queue.add_event(event).await {
+						log_error!(self.logger, "Failed to push to event queue: {}", e);
+						return Err(ReplayEvent());
+					}
+				}
 				self.liquidity_source
 					.lsps2_service()
 					.handle_htlc_handling_failed(failure_type)
@@ -2298,6 +2416,29 @@ mod tests {
 			amount_msat: Some(channel_byte as u64),
 			user_channel_id: Some(UserChannelId(channel_byte as u128)),
 			node_id: None,
+		}
+	}
+
+	#[test]
+	fn payment_receive_failed_round_trips() {
+		let reasons = [
+			PaymentReceiveFailureReason::CircularPayment,
+			PaymentReceiveFailureReason::DuplicatePayment,
+			PaymentReceiveFailureReason::ExcessiveSkimmedFee {
+				counterparty_skimmed_fee_msat: 2_000_000,
+				max_total_opening_fee_msat: 1_000_000,
+			},
+			PaymentReceiveFailureReason::UnexpectedSkimmedFee {
+				counterparty_skimmed_fee_msat: 1_000,
+			},
+			PaymentReceiveFailureReason::UnknownPaymentHash,
+			PaymentReceiveFailureReason::UnknownPreimage,
+			PaymentReceiveFailureReason::Other,
+		];
+		for reason in reasons {
+			let event = Event::PaymentReceiveFailed { payment_hash: PaymentHash([7; 32]), reason };
+			let read = <Event as Readable>::read(&mut &event.encode()[..]).unwrap();
+			assert_eq!(read, event);
 		}
 	}
 
