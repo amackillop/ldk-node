@@ -7420,14 +7420,22 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		#[cfg(feature = "uniffi")]
 		let underpayment = Arc::new(underpayment.into());
 		let payment_id = service_node.bolt11_payment().send(&underpayment, None).unwrap();
-		tokio::select! {
-			_ = async {
-				expect_event!(service_node, PaymentFailed);
-				assert_eq!(service_node.payment(&payment_id).unwrap().unwrap().status, PaymentStatus::Failed);
-			} => {},
-			event = client_node.next_event_async() => {
-				panic!("JIT invoice accepted an underpayment (custom hash: {}): {:?}", payment_hash.is_some(), event);
+		expect_event!(service_node, PaymentFailed);
+		assert_eq!(
+			service_node.payment(&payment_id).unwrap().unwrap().status,
+			PaymentStatus::Failed
+		);
+		match client_node.next_event_async().await {
+			Event::PaymentReceiveFailed { payment_hash: failed_hash, .. }
+				if failed_hash == invoice.payment_hash() =>
+			{
+				client_node.event_handled().unwrap();
 			},
+			event => panic!(
+				"JIT invoice accepted an underpayment (custom hash: {}): {:?}",
+				payment_hash.is_some(),
+				event
+			),
 		}
 	}
 
@@ -7523,6 +7531,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	client_node.bolt11_payment().fail_for_id(client_payment_id).unwrap();
 
 	expect_event!(payer_node, PaymentFailed);
+	expect_event!(client_node, PaymentReceiveFailed);
 	assert_eq!(
 		client_node.payment(&client_payment_id).unwrap().unwrap().status,
 		PaymentStatus::Failed

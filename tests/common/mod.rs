@@ -1656,6 +1656,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert_ne!(manual_fail_payment_id.0, manual_fail_payment_hash.0);
 	node_b.bolt11_payment().fail_for_id(manual_fail_payment_id).unwrap();
 	expect_event!(node_a, PaymentFailed);
+	expect_event!(node_b, PaymentReceiveFailed);
 	let outbound_manual_fail_payment =
 		node_a.payment(&outbound_manual_fail_payment_id).unwrap().unwrap();
 	assert_eq!(outbound_manual_fail_payment.status, PaymentStatus::Failed);
