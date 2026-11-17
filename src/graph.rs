@@ -141,7 +141,7 @@ impl From<lightning::routing::gossip::NodeInfo> for NodeInfo {
 	fn from(value: lightning::routing::gossip::NodeInfo) -> Self {
 		Self {
 			channels: value.channels,
-			announcement_info: value.announcement_info.map(|a| a.into()),
+			announcement_info: value.announcement_info.map(|a| (*a).into()),
 		}
 	}
 }
