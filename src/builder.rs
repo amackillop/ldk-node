@@ -62,7 +62,7 @@ use crate::config::{
 	ElectrumSyncConfig, EsploraSyncConfig, HRNResolverConfig, TorConfig,
 	CHANNEL_TX_FACTS_CACHE_CAPACITY, CHANNEL_TX_FACTS_CACHE_WARMUP_COUNT,
 	DEFAULT_ESPLORA_SERVER_URL, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL, PAYMENT_CACHE_CAPACITY,
-	PAYMENT_CACHE_WARMUP_COUNT,
+	PAYMENT_CACHE_WARMUP_COUNT, RGS_SYNC_TIMEOUT_SECS,
 };
 use crate::connection::ConnectionManager;
 use crate::data_store::{KeepAllEntries, KeepLeastRecentlyUsed};
@@ -144,7 +144,7 @@ enum ChainDataSourceConfig {
 #[derive(Debug, Clone)]
 enum GossipSourceConfig {
 	P2PNetwork,
-	RapidGossipSync(String),
+	RapidGossipSync { server_url: String, timeout_secs: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -522,7 +522,19 @@ impl NodeBuilder {
 	/// Configures the [`Node`] instance to source its gossip data from the given RapidGossipSync
 	/// server.
 	pub fn set_gossip_source_rgs(&mut self, rgs_server_url: String) -> &mut Self {
-		self.gossip_source_config = Some(GossipSourceConfig::RapidGossipSync(rgs_server_url));
+		self.set_gossip_source_rgs_with_timeout(rgs_server_url, RGS_SYNC_TIMEOUT_SECS)
+	}
+
+	/// Configures the [`Node`] instance to source its gossip data from the given RapidGossipSync
+	/// server, giving each snapshot download `timeout_secs` seconds.
+	///
+	/// [`Self::set_gossip_source_rgs`] allows a few seconds, which a slow link cannot fetch a full
+	/// snapshot in.
+	pub fn set_gossip_source_rgs_with_timeout(
+		&mut self, rgs_server_url: String, timeout_secs: u64,
+	) -> &mut Self {
+		self.gossip_source_config =
+			Some(GossipSourceConfig::RapidGossipSync { server_url: rgs_server_url, timeout_secs });
 		self
 	}
 
@@ -1196,6 +1208,17 @@ impl Builder {
 	/// server.
 	pub fn set_gossip_source_rgs(&self, rgs_server_url: String) {
 		self.inner.write().expect("lock").set_gossip_source_rgs(rgs_server_url);
+	}
+
+	/// Configures the [`Node`] instance to source its gossip data from the given RapidGossipSync
+	/// server, giving each snapshot download `timeout_secs` seconds.
+	///
+	/// See [`NodeBuilder::set_gossip_source_rgs_with_timeout`].
+	pub fn set_gossip_source_rgs_with_timeout(&self, rgs_server_url: String, timeout_secs: u64) {
+		self.inner
+			.write()
+			.expect("lock")
+			.set_gossip_source_rgs_with_timeout(rgs_server_url, timeout_secs);
 	}
 
 	/// Configures the [`Node`] instance to source its external scores from the given URL.
@@ -2390,11 +2413,12 @@ fn build_with_store_internal(
 
 			p2p_source
 		},
-		GossipSourceConfig::RapidGossipSync(rgs_server) => {
+		GossipSourceConfig::RapidGossipSync { server_url, timeout_secs } => {
 			let latest_sync_timestamp =
 				network_graph.get_last_rapid_gossip_sync_timestamp().unwrap_or(0);
 			Arc::new(GossipSource::new_rgs(
-				rgs_server.clone(),
+				server_url.clone(),
+				*timeout_secs,
 				latest_sync_timestamp,
 				Arc::clone(&network_graph),
 				Arc::clone(&logger),

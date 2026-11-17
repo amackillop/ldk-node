@@ -12,7 +12,7 @@ use std::sync::Arc;
 use lightning_block_sync::gossip::GossipVerifier;
 
 use crate::chain::ChainSource;
-use crate::config::{RGS_SNAPSHOT_MAX_SIZE, RGS_SYNC_TIMEOUT_SECS};
+use crate::config::RGS_SNAPSHOT_MAX_SIZE;
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 use crate::runtime::Runtime;
 #[cfg(feature = "chain-bitcoind")]
@@ -27,6 +27,7 @@ pub(crate) enum GossipSource {
 	RapidGossipSync {
 		gossip_sync: Arc<RapidGossipSync>,
 		server_url: String,
+		timeout_secs: u64,
 		latest_sync_timestamp: AtomicU32,
 		logger: Arc<Logger>,
 	},
@@ -53,12 +54,18 @@ impl GossipSource {
 	}
 
 	pub fn new_rgs(
-		server_url: String, latest_sync_timestamp: u32, network_graph: Arc<Graph>,
-		logger: Arc<Logger>,
+		server_url: String, timeout_secs: u64, latest_sync_timestamp: u32,
+		network_graph: Arc<Graph>, logger: Arc<Logger>,
 	) -> Self {
 		let gossip_sync = Arc::new(RapidGossipSync::new(network_graph, Arc::clone(&logger)));
 		let latest_sync_timestamp = AtomicU32::new(latest_sync_timestamp);
-		Self::RapidGossipSync { gossip_sync, server_url, latest_sync_timestamp, logger }
+		Self::RapidGossipSync {
+			gossip_sync,
+			server_url,
+			timeout_secs,
+			latest_sync_timestamp,
+			logger,
+		}
 	}
 
 	pub fn is_rgs(&self) -> bool {
@@ -75,13 +82,19 @@ impl GossipSource {
 	pub async fn update_rgs_snapshot(&self) -> Result<u32, Error> {
 		match self {
 			Self::P2PNetwork { gossip_sync: _, .. } => Ok(0),
-			Self::RapidGossipSync { gossip_sync, server_url, latest_sync_timestamp, logger } => {
+			Self::RapidGossipSync {
+				gossip_sync,
+				server_url,
+				timeout_secs,
+				latest_sync_timestamp,
+				logger,
+			} => {
 				let query_timestamp = latest_sync_timestamp.load(Ordering::Acquire);
 				let query_url = format!("{}/{}", server_url, query_timestamp);
 
 				let query = bitreq::get(query_url)
 					.with_max_body_size(Some(RGS_SNAPSHOT_MAX_SIZE))
-					.with_timeout(RGS_SYNC_TIMEOUT_SECS);
+					.with_timeout(*timeout_secs);
 				let response = query.send_async().await.map_err(|e| {
 					log_error!(logger, "Failed to retrieve RGS gossip update: {e}");
 					Error::GossipUpdateTimeout
