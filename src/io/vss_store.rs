@@ -13,7 +13,6 @@ use std::fmt;
 use std::future::Future;
 #[cfg(test)]
 use std::panic::RefUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -89,7 +88,8 @@ pub struct VssStore {
 	inner: Arc<VssStoreInner>,
 	// Version counter to ensure that writes are applied in the correct order. It is assumed that read and list
 	// operations aren't sensitive to the order of execution.
-	next_version: AtomicU64,
+	// A mutex, as some 32-bit targets with std have no 64-bit atomics.
+	next_version: Mutex<u64>,
 	// A VSS-internal runtime that drives VSS I/O independently from the node runtime.
 	internal_runtime: Option<Arc<StoreRuntime>>,
 }
@@ -99,7 +99,7 @@ impl VssStore {
 		base_url: String, store_id: String, vss_seed: [u8; 32],
 		header_provider: Arc<dyn VssHeaderProvider>,
 	) -> io::Result<Self> {
-		let next_version = AtomicU64::new(1);
+		let next_version = Mutex::new(1);
 		let internal_runtime =
 			Arc::new(StoreRuntime::new("ldk-node-vss-runtime", INTERNAL_RUNTIME_WORKERS, "VSS")?);
 
@@ -179,7 +179,11 @@ impl VssStore {
 	fn get_new_version_and_lock_ref(
 		&self, locking_key: String,
 	) -> (Arc<tokio::sync::Mutex<u64>>, u64) {
-		let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+		let version = {
+			let mut counter = self.next_version.lock().unwrap();
+			let next = counter.wrapping_add(1);
+			std::mem::replace(&mut *counter, next)
+		};
 		if version == u64::MAX {
 			panic!("VssStore version counter overflowed");
 		}
