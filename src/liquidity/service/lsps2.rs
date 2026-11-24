@@ -13,7 +13,8 @@ use std::time::Duration;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Transaction;
 use chrono::Utc;
-use lightning::events::HTLCHandlingFailureType;
+use lightning::chain::transaction::OutPoint;
+use lightning::events::{HTLCHandlingFailureType, InboundHTLCLocator};
 use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::types::ChannelId;
 use lightning::sign::EntropySource;
@@ -194,10 +195,11 @@ where
 
 	pub(crate) async fn handle_channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+		funding_txo: Option<OutPoint>,
 	) {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			if let Err(e) = lsps2_service_handler
-				.channel_ready(user_channel_id, channel_id, counterparty_node_id)
+				.channel_ready(user_channel_id, channel_id, counterparty_node_id, funding_txo)
 				.await
 			{
 				log_error!(
@@ -233,9 +235,13 @@ where
 		}
 	}
 
-	pub(crate) async fn handle_htlc_handling_failed(&self, failure_type: HTLCHandlingFailureType) {
+	pub(crate) async fn handle_htlc_handling_failed(
+		&self, failure_type: HTLCHandlingFailureType, prev_htlcs: &[InboundHTLCLocator],
+	) {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-			if let Err(e) = lsps2_service_handler.htlc_handling_failed(failure_type).await {
+			if let Err(e) =
+				lsps2_service_handler.htlc_handling_failed(failure_type, prev_htlcs).await
+			{
 				log_error!(
 					self.logger,
 					"LSPS2 service failed to handle HTLCHandlingFailed event: {:?}",
@@ -246,12 +252,14 @@ where
 	}
 
 	pub(crate) async fn handle_payment_forwarded(
-		&self, next_channel_id: Option<ChannelId>, skimmed_fee_msat: u64,
+		&self, next_channel_id: Option<ChannelId>, prev_htlcs: &[InboundHTLCLocator],
+		skimmed_fee_msat: u64,
 	) {
 		if let Some(next_channel_id) = next_channel_id {
 			if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-				if let Err(e) =
-					lsps2_service_handler.payment_forwarded(next_channel_id, skimmed_fee_msat).await
+				if let Err(e) = lsps2_service_handler
+					.payment_forwarded(next_channel_id, prev_htlcs, skimmed_fee_msat)
+					.await
 				{
 					log_error!(
 						self.logger,

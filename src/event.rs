@@ -2084,7 +2084,7 @@ where
 					prober.handle_background_probe_failed(&path, payment_id);
 				}
 			},
-			LdkEvent::HTLCHandlingFailed { failure_type, failure_reason, .. } => {
+			LdkEvent::HTLCHandlingFailed { failure_type, failure_reason, prev_htlcs, .. } => {
 				if let HTLCHandlingFailureType::Receive { payment_hash } = &failure_type {
 					let reason = self
 						.receive_failures
@@ -2110,7 +2110,7 @@ where
 				}
 				self.liquidity_source
 					.lsps2_service()
-					.handle_htlc_handling_failed(failure_type)
+					.handle_htlc_handling_failed(failure_type, &prev_htlcs)
 					.await;
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id, counterparty_node_id } => {
@@ -2384,6 +2384,7 @@ where
 						.lsps2_service()
 						.handle_payment_forwarded(
 							Some(next_htlc.channel_id),
+							&prev_htlcs,
 							skimmed_fee_msat.unwrap_or(0),
 						)
 						.await;
@@ -2566,9 +2567,26 @@ where
 					}
 				}
 
+				let ldk_funding_txo = funding_txo.and_then(|txo| match u16::try_from(txo.vout) {
+					Ok(index) => Some(LdkOutPoint { txid: txo.txid, index }),
+					Err(_) => {
+						log_error!(
+							self.logger,
+							"Funding output {} of channel {} has an index LSPS2 can't record",
+							txo,
+							channel_id,
+						);
+						None
+					},
+				});
 				self.liquidity_source
 					.lsps2_service()
-					.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
+					.handle_channel_ready(
+						user_channel_id,
+						&channel_id,
+						&counterparty_node_id,
+						ldk_funding_txo,
+					)
 					.await;
 
 				let event = Event::ChannelReady {
