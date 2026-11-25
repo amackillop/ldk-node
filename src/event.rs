@@ -2400,6 +2400,7 @@ where
 						.lsps2_service()
 						.handle_payment_forwarded(
 							Some(next_htlc.channel_id),
+							next_htlc.node_id,
 							&prev_htlcs,
 							skimmed_fee_msat.unwrap_or(0),
 						)

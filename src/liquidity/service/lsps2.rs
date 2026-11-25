@@ -16,7 +16,9 @@ use bitcoin::{Amount, Transaction};
 use chrono::Utc;
 use lightning::chain::transaction::OutPoint;
 use lightning::events::{HTLCHandlingFailureType, InboundHTLCLocator};
-use lightning::ln::channel_state::{ChannelDetails, ChannelShutdownState};
+use lightning::ln::channel_state::{
+	ChannelDetails, ChannelShutdownState, OutboundHTLCStateDetails,
+};
 use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::types::ChannelId;
 use lightning::sign::EntropySource;
@@ -69,7 +71,8 @@ where
 /// that channel rather than opening another, if the client supports splicing, the trust model is
 /// LSP-trusts-client, and the channel can carry the payment: LDK fixes the most a channel carries
 /// in flight when it opens, and a splice does not raise it. A buy whose only channel is not yet
-/// usable waits for it. Otherwise a new channel is opened, as for a client without one.
+/// usable, or whose HTLCs in flight leave no room for the payment, waits for it. Otherwise a new
+/// channel is opened, as for a client without one.
 ///
 /// See [bLIP-52 / LSPS2] for more information.
 ///
@@ -296,6 +299,10 @@ where
 	pub(crate) async fn handle_htlc_handling_failed(
 		&self, failure_type: HTLCHandlingFailureType, prev_htlcs: &[InboundHTLCLocator],
 	) {
+		let next_node_id = match &failure_type {
+			HTLCHandlingFailureType::Forward { node_id, .. } => *node_id,
+			_ => None,
+		};
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			if let Err(e) =
 				lsps2_service_handler.htlc_handling_failed(failure_type, prev_htlcs).await
@@ -307,11 +314,15 @@ where
 				);
 			}
 		}
+		// The HTLC to the peer failed back, leaving room for a buy waiting on its channel.
+		if let Some(next_node_id) = next_node_id {
+			self.request_buys_served(next_node_id);
+		}
 	}
 
 	pub(crate) async fn handle_payment_forwarded(
-		&self, next_channel_id: Option<ChannelId>, prev_htlcs: &[InboundHTLCLocator],
-		skimmed_fee_msat: u64,
+		&self, next_channel_id: Option<ChannelId>, next_node_id: Option<PublicKey>,
+		prev_htlcs: &[InboundHTLCLocator], skimmed_fee_msat: u64,
 	) {
 		if let Some(next_channel_id) = next_channel_id {
 			if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
@@ -326,6 +337,10 @@ where
 					);
 				}
 			}
+		}
+		// The HTLC to the peer settled, leaving room for a buy waiting on its channel.
+		if let Some(next_node_id) = next_node_id {
+			self.request_buys_served(next_node_id);
 		}
 	}
 
@@ -625,7 +640,8 @@ where
 			JitLiquidityPlan::Splice(channel_id) => {
 				self.splice_jit_liquidity(their_network_key, &buy, channel_id, service_config).await
 			},
-			// Served again once that channel's `ChannelReady` asks for it.
+			// Served again on that channel's `ChannelReady`, or once an HTLC to the client settles or
+			// fails back.
 			JitLiquidityPlan::WaitFor(_) => {},
 		}
 	}
@@ -871,8 +887,12 @@ fn client_channel(details: &ChannelDetails) -> ClientChannel {
 	let shutting_down = details
 		.channel_shutdown_state
 		.is_some_and(|state| state != ChannelShutdownState::NotShuttingDown);
-	let outbound_htlcs_msat =
-		details.pending_outbound_htlcs.iter().map(|htlc| htlc.amount_msat).sum();
+	let outbound_htlcs_msat = details
+		.pending_outbound_htlcs
+		.iter()
+		.filter(|htlc| counts_against_htlc_maximum(htlc.state.as_ref()))
+		.map(|htlc| htlc.amount_msat)
+		.sum();
 	ClientChannel {
 		channel_id: details.channel_id,
 		channel_value_sats: details.channel_value_satoshis,
@@ -882,6 +902,19 @@ fn client_channel(details: &ChannelDetails) -> ClientChannel {
 			details.counterparty.outbound_htlc_maximum_msat,
 			outbound_htlcs_msat,
 		),
+	}
+}
+
+/// Whether an HTLC to the client counts against its `max_htlc_value_in_flight_msat`. As in LDK's own
+/// check, it stops counting once the client has resolved it and we have revoked the commitment
+/// that held it.
+fn counts_against_htlc_maximum(state: Option<&OutboundHTLCStateDetails>) -> bool {
+	match state {
+		None
+		| Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToAdd)
+		| Some(OutboundHTLCStateDetails::Committed) => true,
+		Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToRemoveFailure)
+		| Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToRemoveSuccess) => false,
 	}
 }
 
@@ -911,7 +944,8 @@ pub(crate) enum JitLiquidityPlan {
 	Open(OpenReason),
 	/// Splice the liquidity into this channel with the client.
 	Splice(ChannelId),
-	/// Wait for this channel with the client to become usable, then plan again.
+	/// Wait for this channel with the client to become usable, or for its HTLCs in flight to
+	/// settle, then plan again.
 	WaitFor(ChannelId),
 }
 
@@ -954,7 +988,7 @@ pub(crate) enum ClientChannelState {
 	/// A `shutdown` was sent or received for the channel.
 	ShuttingDown,
 	/// The channel is ready, with `outbound_htlcs_msat` of HTLCs to the client in flight, which
-	/// count against the same maximum. Its peer may be reestablishing it.
+	/// count against the same maximum until they settle. Its peer may be reestablishing it.
 	Usable { outbound_htlc_maximum_msat: u64, outbound_htlcs_msat: u64 },
 }
 
@@ -963,9 +997,10 @@ pub(crate) enum ClientChannelState {
 ///
 /// A client that can't be spliced with, as it lacks `option_splice` or the service uses the
 /// client-trusts-LSP model, gets a new channel. Otherwise we splice into a usable channel with
-/// room for the payment and wait for a pending channel that may have room, rather than open a
-/// second channel beside it. Among several, we prefer the largest and then the lowest channel id.
-/// We open a new channel when no channel exists or none can carry the payment.
+/// room for the payment, and wait for a pending channel that may have room or a usable one whose
+/// HTLCs in flight fill it, rather than open a second channel beside it. Among several, we prefer
+/// the largest and then the lowest channel id. We open a new channel when no channel exists or none
+/// can carry the payment.
 pub(crate) fn plan_jit_liquidity(
 	client_supports_splicing: bool, client_trusts_lsp: bool, amt_to_forward_msat: u64,
 	channels: &[ClientChannel],
@@ -992,7 +1027,10 @@ pub(crate) fn plan_jit_liquidity(
 		ClientChannelState::Pending { outbound_htlc_maximum_msat } => {
 			outbound_htlc_maximum_msat.map_or(true, |maximum| maximum >= amt_to_forward_msat)
 		},
-		ClientChannelState::ShuttingDown | ClientChannelState::Usable { .. } => false,
+		ClientChannelState::ShuttingDown => false,
+		ClientChannelState::Usable { outbound_htlc_maximum_msat, .. } => {
+			outbound_htlc_maximum_msat >= amt_to_forward_msat
+		},
 	};
 
 	if let Some(channel) = channels.iter().filter(has_room).max_by_key(preference) {
@@ -1140,7 +1178,7 @@ mod tests {
 	}
 
 	#[test]
-	fn htlcs_in_flight_count_against_the_htlc_maximum() {
+	fn a_usable_channel_whose_htlcs_in_flight_fill_it_is_waited_for() {
 		let channel = with_state(
 			1,
 			1_000_000,
@@ -1149,7 +1187,38 @@ mod tests {
 				outbound_htlcs_msat: 1,
 			},
 		);
-		assert_eq!(plan(&[channel]), JitLiquidityPlan::Open(OpenReason::AboveHtlcMaximum));
+		assert_eq!(plan(&[channel]), JitLiquidityPlan::WaitFor(channel.channel_id));
+	}
+
+	#[test]
+	fn a_channel_with_room_is_spliced_into_before_one_whose_htlcs_fill_it_is_waited_for() {
+		let busy = with_state(
+			1,
+			1_000_000,
+			ClientChannelState::Usable {
+				outbound_htlc_maximum_msat: AMOUNT_MSAT,
+				outbound_htlcs_msat: 1,
+			},
+		);
+		let channel = usable(2, 100_000);
+		assert_eq!(plan(&[busy, channel]), JitLiquidityPlan::Splice(channel.channel_id));
+	}
+
+	#[test]
+	fn htlcs_count_against_the_htlc_maximum_until_the_client_removes_them() {
+		for state in [
+			None,
+			Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToAdd),
+			Some(OutboundHTLCStateDetails::Committed),
+		] {
+			assert!(counts_against_htlc_maximum(state.as_ref()), "{:?}", state);
+		}
+		for state in [
+			Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToRemoveFailure),
+			Some(OutboundHTLCStateDetails::AwaitingRemoteRevokeToRemoveSuccess),
+		] {
+			assert!(!counts_against_htlc_maximum(state.as_ref()), "{:?}", state);
+		}
 	}
 
 	#[test]
