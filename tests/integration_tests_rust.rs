@@ -8357,6 +8357,7 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 		service_funds_sat,
 		client_trusts_0conf,
 		Lsps2Channels::Anchors,
+		None,
 	)
 	.await
 }
@@ -8373,17 +8374,31 @@ enum Lsps2Channels {
 	Spliceable,
 }
 
-/// Like [`setup_lsps2_nodes`], with the service opening `channels` to the client.
+impl Lsps2Channels {
+	#[cfg_attr(not(feature = "chain-bitcoind"), allow(unused_variables))]
+	fn chain_source<'a>(
+		self, bitcoind: &'a BitcoinD, electrsd: &'a ElectrsD,
+	) -> TestChainSource<'a> {
+		match self {
+			Self::Anchors => TestChainSource::Esplora(electrsd),
+			#[cfg(feature = "chain-bitcoind")]
+			Self::Spliceable => TestChainSource::BitcoindRpcSync(bitcoind),
+		}
+	}
+
+	fn spliceable(self) -> bool {
+		!matches!(self, Self::Anchors)
+	}
+}
+
+/// Like [`setup_lsps2_nodes`], with the service opening `channels` to the client and logging to
+/// `service_logs` if given.
 async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
 	client_trusts_0conf: bool, channels: Lsps2Channels,
+	service_logs: Option<Arc<CollectingLogWriter>>,
 ) -> (TestNode, TestNode, TestNode) {
-	let spliceable = !matches!(channels, Lsps2Channels::Anchors);
-	let chain_source = match channels {
-		Lsps2Channels::Anchors => TestChainSource::Esplora(electrsd),
-		#[cfg(feature = "chain-bitcoind")]
-		Lsps2Channels::Spliceable => TestChainSource::BitcoindRpcSync(bitcoind),
-	};
+	let spliceable = channels.spliceable();
 
 	let lsps2_service_config = LSPS2ServiceConfig {
 		require_token: None,
@@ -8402,26 +8417,21 @@ async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	let mut service_config = random_config();
 	service_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
 	setup_builder!(service_builder, service_config.node_config);
-	configure_chain_source(&chain_source, &mut service_builder, &service_config);
+	configure_chain_source(
+		&channels.chain_source(bitcoind, electrsd),
+		&mut service_builder,
+		&service_config,
+	);
 	service_builder.enable_liquidity_provider(lsps2_service_config);
+	if let Some(service_logs) = service_logs {
+		service_builder.set_custom_logger(service_logs);
+	}
 	let service_node = service_builder
 		.build_with_store(service_config.node_entropy.into(), service_store)
 		.unwrap();
 	service_node.start().unwrap();
-	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
-
-	let mut client_config = random_config();
-	client_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
-	setup_builder!(client_builder, client_config.node_config);
-	configure_chain_source(&chain_source, &mut client_builder, &client_config);
-	client_builder.add_liquidity_source(
-		service_node.node_id(),
-		service_addr,
-		None,
-		client_trusts_0conf,
-	);
-	let client_node = client_builder.build(client_config.node_entropy.into()).unwrap();
-	client_node.start().unwrap();
+	let client_node =
+		build_lsps2_client(bitcoind, electrsd, &service_node, client_trusts_0conf, channels);
 
 	let payer_config = random_config();
 	setup_builder!(payer_builder, payer_config.node_config);
@@ -8455,6 +8465,33 @@ async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
 	(service_node, client_node, payer_node)
+}
+
+/// Starts a client of the LSPS2 service run by `service_node`, with no on-chain funds, accepting
+/// `channels` from it.
+fn build_lsps2_client(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_node: &TestNode, client_trusts_0conf: bool,
+	channels: Lsps2Channels,
+) -> TestNode {
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	let mut client_config = random_config();
+	client_config.node_config.anchor_channels_config.enable_zero_fee_commitments |=
+		channels.spliceable();
+	setup_builder!(client_builder, client_config.node_config);
+	configure_chain_source(
+		&channels.chain_source(bitcoind, electrsd),
+		&mut client_builder,
+		&client_config,
+	);
+	client_builder.add_liquidity_source(
+		service_node.node_id(),
+		service_addr,
+		None,
+		client_trusts_0conf,
+	);
+	let client_node = client_builder.build(client_config.node_entropy.into()).unwrap();
+	client_node.start().unwrap();
+	client_node
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -8662,6 +8699,7 @@ async fn lsps2_service_splices_later_buys_into_the_clients_channel() {
 		10_000_000,
 		true,
 		Lsps2Channels::Spliceable,
+		None,
 	)
 	.await;
 
@@ -8706,6 +8744,7 @@ async fn lsps2_service_fails_payment_if_it_cannot_fund_a_splice() {
 		250_000,
 		true,
 		Lsps2Channels::Spliceable,
+		None,
 	)
 	.await;
 	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
@@ -8756,24 +8795,24 @@ async fn lsps2_service_forwards_a_spliced_buy_after_restarting_before_the_lock()
 		10_000_000,
 		false,
 		Lsps2Channels::Spliceable,
+		None,
 	)
 	.await;
 
-	let first_payment_id = pay_jit_invoice(&client_node, &payer_node, 100_000_000);
-	expect_channel_pending_event!(service_node, client_node.node_id());
-	expect_channel_pending_event!(client_node, service_node.node_id());
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-	service_node.sync_wallets().unwrap();
-	client_node.sync_wallets().unwrap();
-	expect_channel_ready_event!(service_node, client_node.node_id());
-	expect_event!(service_node, PaymentForwarded);
-	expect_channel_ready_event!(client_node, service_node.node_id());
-	expect_payment_successful_event!(payer_node, first_payment_id, None);
-	expect_payment_received_event!(client_node, 100_000_000 * 99 / 100);
+	open_first_confirmed_jit_channel(
+		&bitcoind,
+		&electrsd,
+		&service_node,
+		&client_node,
+		&payer_node,
+		100_000_000,
+	)
+	.await;
 
 	let amount_msat = 50_000_000;
 	let payer_payment_id = pay_jit_invoice(&client_node, &payer_node, amount_msat);
-	expect_splice_negotiated_event!(service_node, client_node.node_id());
+	let splice_txo = expect_splice_negotiated_event!(service_node, client_node.node_id());
+	wait_for_tx(&electrsd.client, splice_txo.txid).await;
 
 	// The buy's binding to the splice survives the restart.
 	service_node.stop().unwrap();
@@ -8781,14 +8820,368 @@ async fn lsps2_service_forwards_a_spliced_buy_after_restarting_before_the_lock()
 	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
 	client_node.connect(service_node.node_id(), service_addr, false).unwrap();
 
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-	service_node.sync_wallets().unwrap();
-	client_node.sync_wallets().unwrap();
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_node]).await;
 	expect_channel_ready_event!(service_node, client_node.node_id());
 	expect_event!(service_node, PaymentForwarded);
 	expect_channel_ready_event!(client_node, service_node.node_id());
 	expect_payment_successful_event!(payer_node, payer_payment_id, None);
 	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+	assert_eq!(client_node.list_channels().len(), 1);
+}
+
+/// The next `count` events of `node`, in the order they arrive.
+#[cfg(feature = "chain-bitcoind")]
+async fn next_events(node: &TestNode, count: usize) -> Vec<Event> {
+	let mut events = Vec::with_capacity(count);
+	for _ in 0..count {
+		let event = tokio::time::timeout(
+			Duration::from_secs(common::INTEROP_TIMEOUT_SECS),
+			node.next_event_async(),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("{} timed out waiting for an event", node.node_id()));
+		println!("{} got event {:?}", node.node_id(), event);
+		node.event_handled().unwrap();
+		events.push(event);
+	}
+	events
+}
+
+#[cfg(feature = "chain-bitcoind")]
+fn count_events(events: &[Event], is_kind: impl Fn(&Event) -> bool) -> usize {
+	events.iter().filter(|event| is_kind(event)).count()
+}
+
+/// Waits for the service to log `text`, failing with its LSPS2 log lines if it doesn't.
+#[cfg(feature = "chain-bitcoind")]
+async fn assert_logged(service_logs: &CollectingLogWriter, text: &str) {
+	assert!(
+		service_logs.wait_for(text).await,
+		"{:?} not logged: {:?}",
+		text,
+		service_logs.lines().iter().filter(|line| line.contains("LSPS2")).collect::<Vec<_>>()
+	);
+}
+
+/// The transaction of the one splice negotiated among `events`.
+#[cfg(feature = "chain-bitcoind")]
+fn negotiated_splice_txid(events: &[Event]) -> Txid {
+	let txids: Vec<Txid> = events
+		.iter()
+		.filter_map(|event| match event {
+			Event::SpliceNegotiated { new_funding_txo, .. } => Some(new_funding_txo.txid),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(txids.len(), 1, "{:?}", events);
+	txids[0]
+}
+
+/// Mines enough blocks to lock a channel or splice awaiting confirmations, and syncs `nodes`.
+#[cfg(feature = "chain-bitcoind")]
+async fn confirm_and_sync(bitcoind: &BitcoinD, electrsd: &ElectrsD, nodes: &[&TestNode]) {
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	nodes.iter().for_each(|node| node.sync_wallets().unwrap());
+}
+
+/// The service's first buy for a client that awaits confirmations, which opens its channel.
+#[cfg(feature = "chain-bitcoind")]
+async fn open_first_confirmed_jit_channel(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_node: &TestNode, client_node: &TestNode,
+	payer_node: &TestNode, amount_msat: u64,
+) {
+	let payer_payment_id = pay_jit_invoice(client_node, payer_node, amount_msat);
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	confirm_and_sync(bitcoind, electrsd, &[service_node, client_node]).await;
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+}
+
+/// The payment ids of the next `count` events of the payer, each a `PaymentSuccessful`.
+#[cfg(feature = "chain-bitcoind")]
+async fn next_successful_payments(payer_node: &TestNode, count: usize) -> HashSet<PaymentId> {
+	next_events(payer_node, count)
+		.await
+		.into_iter()
+		.map(|event| match event {
+			Event::PaymentSuccessful { payment_id, .. } => payment_id,
+			e => panic!("unexpected event {:?}", e),
+		})
+		.collect()
+}
+
+/// Asserts a client whose channel is spliced once per buy received each of `amounts_msat` less
+/// the 1% fee, and the payer saw each of `payment_ids` succeed.
+#[cfg(feature = "chain-bitcoind")]
+async fn assert_spliced_buys_paid(
+	client_node: &TestNode, payer_node: &TestNode, amounts_msat: &[u64],
+	payment_ids: &HashSet<PaymentId>,
+) {
+	let client_events = next_events(client_node, 2 * amounts_msat.len()).await;
+	let mut received_msat: Vec<u64> = client_events
+		.iter()
+		.filter_map(|event| match event {
+			Event::PaymentReceived { amount_msat, .. } => Some(*amount_msat),
+			_ => None,
+		})
+		.collect();
+	received_msat.sort_unstable();
+	let mut expected_msat: Vec<u64> =
+		amounts_msat.iter().map(|amount_msat| amount_msat * 99 / 100).collect();
+	expected_msat.sort_unstable();
+	assert_eq!(received_msat, expected_msat, "{:?}", client_events);
+	assert_eq!(
+		count_events(&client_events, |e| matches!(e, Event::ChannelReady { .. })),
+		amounts_msat.len(),
+		"{:?}",
+		client_events
+	);
+	assert_eq!(&next_successful_payments(payer_node, payment_ids.len()).await, payment_ids);
+}
+
+#[cfg(feature = "chain-bitcoind")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_splices_concurrent_buys_of_a_client_one_at_a_time() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// The client awaits confirmations, so a splice stays pending until the test mines.
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let service_logs = Arc::new(CollectingLogWriter::new());
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		false,
+		Lsps2Channels::Spliceable,
+		Some(Arc::clone(&service_logs)),
+	)
+	.await;
+	open_first_confirmed_jit_channel(
+		&bitcoind,
+		&electrsd,
+		&service_node,
+		&client_node,
+		&payer_node,
+		100_000_000,
+	)
+	.await;
+
+	let amounts_msat = [30_000_000, 20_000_000];
+	let payment_ids: HashSet<PaymentId> = amounts_msat
+		.iter()
+		.map(|&amount_msat| pay_jit_invoice(&client_node, &payer_node, amount_msat))
+		.collect();
+	let first_splice_txo = expect_splice_negotiated_event!(service_node, client_node.node_id());
+	assert_logged(&service_logs, "awaits a splice for another buy").await;
+	wait_for_tx(&electrsd.client, first_splice_txo.txid).await;
+
+	// The first splice locking frees the channel for the second buy's.
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_node]).await;
+	let events = next_events(&service_node, 3).await;
+	assert!(matches!(events[0], Event::ChannelReady { .. }), "{:?}", events);
+	assert_eq!(count_events(&events, |e| matches!(e, Event::PaymentForwarded { .. })), 1);
+	let second_splice_txid = negotiated_splice_txid(&events);
+	wait_for_tx(&electrsd.client, second_splice_txid).await;
+	// A fresh splice of the locked funding, not an RBF of the first.
+	let second_splice_tx = electrsd.client.transaction_get(&second_splice_txid).unwrap();
+	assert!(second_splice_tx.input.iter().any(|input| input.previous_output == first_splice_txo));
+
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_node]).await;
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	assert_spliced_buys_paid(&client_node, &payer_node, &amounts_msat, &payment_ids).await;
+	assert_eq!(client_node.list_channels().len(), 1);
+}
+
+#[cfg(feature = "chain-bitcoind")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_splices_a_buy_made_while_the_jit_channel_is_pending() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// The client awaits confirmations, so the JIT channel stays pending until the test mines.
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let service_logs = Arc::new(CollectingLogWriter::new());
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		false,
+		Lsps2Channels::Spliceable,
+		Some(Arc::clone(&service_logs)),
+	)
+	.await;
+
+	let opening_amount_msat = 100_000_000;
+	let opening_payment_id = pay_jit_invoice(&client_node, &payer_node, opening_amount_msat);
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+
+	// The second buy waits for the pending channel rather than opening another.
+	// Small enough to fit beside the opening payment, whether or not it is still in flight.
+	let amount_msat = 5_000_000;
+	let payer_payment_id = pay_jit_invoice(&client_node, &payer_node, amount_msat);
+	assert_logged(&service_logs, ": WaitFor(").await;
+
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_node]).await;
+	let events = next_events(&service_node, 3).await;
+	assert!(matches!(events[0], Event::ChannelReady { .. }), "{:?}", events);
+	assert_eq!(count_events(&events, |e| matches!(e, Event::PaymentForwarded { .. })), 1);
+	wait_for_tx(&electrsd.client, negotiated_splice_txid(&events)).await;
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_received_event!(client_node, opening_amount_msat * 99 / 100);
+	expect_payment_successful_event!(payer_node, opening_payment_id, None);
+
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_node]).await;
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	assert_spliced_buys_paid(
+		&client_node,
+		&payer_node,
+		&[amount_msat],
+		&HashSet::from([payer_payment_id]),
+	)
+	.await;
+	assert_eq!(client_node.list_channels().len(), 1);
+}
+
+#[cfg(feature = "chain-bitcoind")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_splices_two_clients_at_once_from_disjoint_inputs() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// The clients await confirmations, so both splices stay pending until the test mines.
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_a, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		false,
+		Lsps2Channels::Spliceable,
+		None,
+	)
+	.await;
+	let client_b =
+		build_lsps2_client(&bitcoind, &electrsd, &service_node, false, Lsps2Channels::Spliceable);
+
+	// A coin for each splice, and the anchor reserve without which client_b rejects the channel.
+	let addrs = vec![
+		service_node.onchain_payment().new_address().unwrap(),
+		client_b.onchain_payment().new_address().unwrap(),
+	];
+	distribute_funds_unconfirmed(
+		&bitcoind.client,
+		&electrsd.client,
+		addrs,
+		Amount::from_sat(10_000_000),
+	)
+	.await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	service_node.sync_wallets().unwrap();
+	client_b.sync_wallets().unwrap();
+	for client_node in [&client_a, &client_b] {
+		open_first_confirmed_jit_channel(
+			&bitcoind,
+			&electrsd,
+			&service_node,
+			client_node,
+			&payer_node,
+			100_000_000,
+		)
+		.await;
+	}
+
+	let amount_msat = 30_000_000;
+	let payment_ids: HashSet<PaymentId> = [&client_a, &client_b]
+		.into_iter()
+		.map(|client_node| pay_jit_invoice(client_node, &payer_node, amount_msat))
+		.collect();
+	let mut splices = Vec::new();
+	for event in next_events(&service_node, 2).await {
+		let Event::SpliceNegotiated { counterparty_node_id, new_funding_txo, .. } = event else {
+			panic!("unexpected event {:?}", event);
+		};
+		wait_for_tx(&electrsd.client, new_funding_txo.txid).await;
+		let splice_tx = electrsd.client.transaction_get(&new_funding_txo.txid).unwrap();
+		splices.push((counterparty_node_id, splice_tx));
+	}
+	let counterparties: HashSet<_> = splices.iter().map(|(node_id, _)| *node_id).collect();
+	assert_eq!(counterparties, HashSet::from([client_a.node_id(), client_b.node_id()]));
+	let inputs = |tx: &Transaction| -> HashSet<bitcoin::OutPoint> {
+		tx.input.iter().map(|input| input.previous_output).collect()
+	};
+	assert!(inputs(&splices[0].1).is_disjoint(&inputs(&splices[1].1)));
+
+	confirm_and_sync(&bitcoind, &electrsd, &[&service_node, &client_a, &client_b]).await;
+	let events = next_events(&service_node, 4).await;
+	let ready: HashSet<_> = events
+		.iter()
+		.filter_map(|event| match event {
+			Event::ChannelReady { counterparty_node_id, .. } => *counterparty_node_id,
+			_ => None,
+		})
+		.collect();
+	assert_eq!(ready, counterparties, "{:?}", events);
+	assert_eq!(count_events(&events, |e| matches!(e, Event::PaymentForwarded { .. })), 2);
+	for client_node in [&client_a, &client_b] {
+		expect_channel_ready_event!(client_node, service_node.node_id());
+		expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+		assert_eq!(client_node.list_channels().len(), 1);
+	}
+	assert_eq!(next_successful_payments(&payer_node, 2).await, payment_ids);
+}
+
+#[cfg(feature = "chain-bitcoind")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_fails_payment_if_its_coins_are_unconfirmed() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let service_logs = Arc::new(CollectingLogWriter::new());
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		true,
+		Lsps2Channels::Spliceable,
+		Some(Arc::clone(&service_logs)),
+	)
+	.await;
+	// The service's only coin is now its funding's unconfirmed change, which the sync shows it.
+	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
+	service_node.sync_wallets().unwrap();
+	let channel_sats = client_node.list_channels().first().unwrap().channel_value_sats;
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("splice")).unwrap());
+	let jit_amount_msat = 50_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.unwrap();
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_event!(payer_node, PaymentFailed);
+	assert!(
+		service_logs.contains("Coin selection failed to find suitable inputs"),
+		"{:?}",
+		service_logs.lines().iter().filter(|line| line.contains("LSPS2")).collect::<Vec<_>>()
+	);
+	assert_eq!(service_node.next_event(), None);
+	assert_eq!(client_node.list_channels().first().unwrap().channel_value_sats, channel_sats);
+
+	// Once the change confirms, a retry of the payment is spliced in.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	service_node.sync_wallets().unwrap();
+	let payer_payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_splice_negotiated_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, jit_amount_msat * 99 / 100);
 	assert_eq!(client_node.list_channels().len(), 1);
 }
 
