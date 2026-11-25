@@ -10,7 +10,7 @@
 pub(crate) mod client;
 pub(crate) mod service;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -27,7 +27,7 @@ use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfi
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 pub use service::lsps2::LSPS2ServiceConfig;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::builder::BuildError;
 use crate::connection::ConnectionManager;
@@ -442,6 +442,8 @@ where
 				liquidity_manager: Arc::clone(&liquidity_manager),
 				config: self.config.clone(),
 				logger: self.logger.clone(),
+				buys_to_serve: Mutex::new(HashSet::new()),
+				buys_to_serve_notify: Notify::new(),
 			}),
 			pending_lsps0_discovery: Mutex::new(HashMap::new()),
 			discovery_done_tx,

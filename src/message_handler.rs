@@ -72,7 +72,9 @@ where
 	fn peer_connected(
 		&self, their_node_id: PublicKey, msg: &lightning::ln::msgs::Init, inbound: bool,
 	) -> Result<(), ()> {
-		self.liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound)
+		self.liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound)?;
+		self.liquidity_source.lsps2_service().request_buys_served(their_node_id);
+		Ok(())
 	}
 
 	fn peer_disconnected(&self, their_node_id: PublicKey) {

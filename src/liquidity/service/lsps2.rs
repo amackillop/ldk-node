@@ -6,26 +6,34 @@
 // accordance with one or both of these licenses.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::Transaction;
+use bitcoin::{Amount, Transaction};
 use chrono::Utc;
 use lightning::chain::transaction::OutPoint;
 use lightning::events::{HTLCHandlingFailureType, InboundHTLCLocator};
+use lightning::ln::channel_state::{ChannelDetails, ChannelShutdownState};
 use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::types::ChannelId;
 use lightning::sign::EntropySource;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
 use lightning_liquidity::lsps2::event::LSPS2ServiceEvent;
 use lightning_liquidity::lsps2::msgs::LSPS2RawOpeningFeeParams;
-use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
+use lightning_liquidity::lsps2::service::{
+	BuyAwaitingChannel, LSPS2ServiceConfig as LdkLSPS2ServiceConfig,
+};
+use lightning_types::features::InitFeatures;
 use lightning_types::payment::PaymentHash;
+use tokio::sync::Notify;
 
-use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
-use crate::logger::{log_error, log_trace, LdkLogger};
+use crate::fee_estimator::{
+	max_funding_feerate, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
+};
+use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
 use crate::{total_anchor_channels_reserve_sats, Config};
 
@@ -50,9 +58,18 @@ where
 	pub(crate) liquidity_manager: Arc<LiquidityManager>,
 	pub(crate) config: Arc<Config>,
 	pub(crate) logger: L,
+	/// Clients whose buys awaiting a channel are to be served, by [`Self::serve_requested_buys`].
+	pub(crate) buys_to_serve: Mutex<HashSet<PublicKey>>,
+	pub(crate) buys_to_serve_notify: Notify,
 }
 
 /// Represents the configuration of the LSPS2 service.
+///
+/// A buy from a client that already has a channel with us is served by splicing the liquidity into
+/// that channel rather than opening another, if the client supports splicing, the trust model is
+/// LSP-trusts-client, and the channel can carry the payment: LDK fixes the most a channel carries
+/// in flight when it opens, and a splice does not raise it. A buy whose only channel is not yet
+/// usable waits for it. Otherwise a new channel is opened, as for a client without one.
 ///
 /// See [bLIP-52 / LSPS2] for more information.
 ///
@@ -97,6 +114,9 @@ pub struct LSPS2ServiceConfig {
 	/// Note this will render the flow incompatible with clients utilizing the 'LSP-trust-client'
 	/// trust model, i.e., in turn delay *claiming* any HTLCs until they see the funding
 	/// transaction in the mempool.
+	///
+	/// The model also rules out splicing a buy into an existing channel, as LDK broadcasts a splice
+	/// transaction once it is signed.
 	///
 	/// Please refer to [`bLIP-52`] for more information.
 	///
@@ -207,6 +227,44 @@ where
 					"LSPS2 service failed to handle ChannelReady event: {:?}",
 					e
 				);
+			}
+		}
+	}
+
+	pub(crate) async fn handle_splice_negotiated(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId, new_funding_txo: OutPoint,
+	) {
+		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+			// Errors for a splice no buy awaits, e.g., one the operator initiated.
+			if let Err(e) = lsps2_service_handler
+				.splice_negotiated(counterparty_node_id, channel_id, new_funding_txo)
+				.await
+			{
+				log_trace!(
+					self.logger,
+					"LSPS2 service did not take the splice of channel {} for a buy: {:?}",
+					channel_id,
+					e
+				);
+			}
+		}
+	}
+
+	pub(crate) async fn handle_splice_negotiation_failed(
+		&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId,
+	) {
+		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
+			// Errors for a splice no buy awaits, and for a failed RBF round of one negotiated
+			// before, which may still lock.
+			match lsps2_service_handler.splice_failed(counterparty_node_id, channel_id).await {
+				// The channel is free for buys deferred while the splice was pending.
+				Ok(()) => self.request_buys_served(*counterparty_node_id),
+				Err(e) => log_trace!(
+					self.logger,
+					"LSPS2 service did not fail a buy for the splice of channel {}: {:?}",
+					channel_id,
+					e
+				),
 			}
 		}
 	}
@@ -455,183 +513,399 @@ where
 					return;
 				}
 			},
-			LSPS2ServiceEvent::OpenChannel {
-				their_network_key,
-				amt_to_forward_msat,
-				opening_fee_msat: _,
-				user_channel_id,
-				intercept_scid: _,
-			} => {
+			LSPS2ServiceEvent::OpenChannel { their_network_key, .. } => {
 				if self.liquidity_manager.lsps2_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
 					return;
 				};
-
-				let service_config = if let Some(service_config) =
-					self.lsps2_service.as_ref().map(|s| s.service_config.clone())
-				{
-					service_config
-				} else {
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
-					return;
-				};
-
-				let peer_manager = self
-					.peer_manager
-					.read()
-					.expect("lock")
-					.as_ref()
-					.and_then(|weak| weak.upgrade());
-				let Some(peer_manager) = peer_manager else {
-					debug_assert!(false, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					return;
-				};
-
-				// Fail if we're not connected to the prospective channel partner.
-				let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) else {
-					log_error!(
-						self.logger,
-						"Failed to open LSPS2 channel to {} due to peer not being connected.",
-						their_network_key,
-					);
-					// TODO: We fail the payment back here. Eventually we will need to remember
-					// the pending requests and regularly retry opening the channel until we
-					// succeed.
-					self.fail_channel_open(&their_network_key, user_channel_id).await;
-					return;
-				};
-				let init_features = peer.init_features;
-
-				// Fail if we have insufficient onchain funds available.
-				let over_provisioning_msat = amt_to_forward_msat
-					.saturating_mul(service_config.channel_over_provisioning_ppm as u64)
-					/ 1_000_000;
-				let channel_amount_sats =
-					amt_to_forward_msat.saturating_add(over_provisioning_msat) / 1000;
-				let cur_anchor_reserve_sats =
-					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-				let spendable_amount_sats =
-					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
-				let anchor_channel =
-					crate::peer_may_negotiate_anchor_channel_type(&self.config, &init_features);
-				let additional_reserve_required = crate::new_channel_anchor_reserve_sats(
-					&self.config,
-					&their_network_key,
-					anchor_channel,
-				);
-				let required_funds_sats =
-					channel_amount_sats.saturating_add(additional_reserve_required);
-				if spendable_amount_sats < required_funds_sats {
-					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-						spendable_amount_sats, required_funds_sats,
-					);
-					// TODO: We fail the payment back here. Eventually we will need to remember
-					// the pending requests and regularly retry opening the channel until we
-					// succeed.
-					self.fail_channel_open(&their_network_key, user_channel_id).await;
-					return;
-				}
-
-				// The funding transaction's fee is paid from the same on-chain funds, so we can't
-				// fund more than we would when opening a channel with all of them.
-				let total_anchor_reserve_sats =
-					cur_anchor_reserve_sats.saturating_add(additional_reserve_required);
-				let funding_fee_rate =
-					self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-				let max_amount = match self
-					.wallet
-					.get_max_funding_amount(total_anchor_reserve_sats, funding_fee_rate)
-				{
-					Ok(max_amount) => max_amount,
-					Err(e) => {
-						log_error!(
-							self.logger,
-							"Unable to create channel as the maximum funding amount couldn't be determined: {:?}",
-							e,
-						);
-						self.fail_channel_open(&their_network_key, user_channel_id).await;
-						return;
-					},
-				};
-				if channel_amount_sats > max_amount {
-					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Requested: {}sats, Maximum: {}sats (fee rate: {} sat/kw, anchor reserve: {}sats)",
-						channel_amount_sats, max_amount, funding_fee_rate.to_sat_per_kwu(), total_anchor_reserve_sats,
-					);
-					self.fail_channel_open(&their_network_key, user_channel_id).await;
-					return;
-				}
-
-				let mut config = self.channel_manager.get_current_config().clone();
-
-				// If we act as an LSPS2 service, the HTLC-value-in-flight must be 100% of the
-				// channel value to ensure we can forward the initial payment. That cap only
-				// applies to unannounced channels, so the channel must also be unannounced.
-				debug_assert_eq!(
-					config
-						.channel_handshake_config
-						.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
-					100
-				);
-				debug_assert!(!config.channel_handshake_config.announce_for_forwarding);
-				debug_assert!(config.accept_forwards_to_priv_channels);
-
-				// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
-				//
-				// TODO: revisit this decision eventually.
-				config.channel_config.forwarding_fee_base_msat = 0;
-				config.channel_config.forwarding_fee_proportional_millionths = 0;
-
-				let result = if service_config.disable_client_reserve {
-					self.channel_manager.create_channel_to_trusted_peer_0reserve(
-						their_network_key,
-						channel_amount_sats,
-						0,
-						user_channel_id,
-						None,
-						Some(config),
-					)
-				} else {
-					self.channel_manager.create_channel(
-						their_network_key,
-						channel_amount_sats,
-						0,
-						user_channel_id,
-						None,
-						Some(config),
-					)
-				};
-
-				match result {
-					Ok(_) => {},
-					Err(e) => {
-						let zero_reserve_string =
-							if service_config.disable_client_reserve { "0reserve " } else { "" };
-						log_error!(
-							self.logger,
-							"Failed to open LSPS2 {}channel to {}: {:?}",
-							zero_reserve_string,
-							their_network_key,
-							e
-						);
-						// TODO: We fail the payment back here. Eventually we will need to remember
-						// the pending requests and regularly retry opening the channel until we
-						// succeed.
-						self.fail_channel_open(&their_network_key, user_channel_id).await;
-						return;
-					},
-				}
+				// Served from the buys awaiting a channel, as a deferred buy is later.
+				self.request_buys_served(their_network_key);
 			},
 		}
+	}
+
+	/// Asks for the buys of `counterparty_node_id` awaiting a channel to be served, e.g., once its
+	/// channel became ready or it reconnected.
+	pub(crate) fn request_buys_served(&self, counterparty_node_id: PublicKey) {
+		if self.liquidity_manager.lsps2_service_handler().is_none() {
+			return;
+		}
+		self.buys_to_serve.lock().expect("lock").insert(counterparty_node_id);
+		self.buys_to_serve_notify.notify_one();
+	}
+
+	/// Waits for [`Self::request_buys_served`].
+	pub(crate) async fn buys_to_serve_requested(&self) {
+		self.buys_to_serve_notify.notified().await
+	}
+
+	/// Serves the buys asked for through [`Self::request_buys_served`].
+	pub(crate) async fn serve_requested_buys(&self) {
+		let counterparties: Vec<PublicKey> =
+			self.buys_to_serve.lock().expect("lock").drain().collect();
+		for counterparty_node_id in counterparties {
+			self.serve_buys(&counterparty_node_id).await;
+		}
+	}
+
+	/// Provides the liquidity for every buy of `counterparty_node_id` that awaits a channel.
+	///
+	/// lightning-liquidity emits `OpenChannel` once per buy and does not replay it, so a buy we
+	/// deferred is served from its listing in `buys_awaiting_channel` later.
+	async fn serve_buys(&self, counterparty_node_id: &PublicKey) {
+		let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() else {
+			return;
+		};
+		let Some(service_config) = self.lsps2_service.as_ref().map(|s| s.service_config.clone())
+		else {
+			return;
+		};
+		for buy in lsps2_service_handler.buys_awaiting_channel(counterparty_node_id) {
+			self.serve_buy(counterparty_node_id, buy, &service_config).await;
+		}
+	}
+
+	async fn serve_buy(
+		&self, their_network_key: &PublicKey, buy: BuyAwaitingChannel,
+		service_config: &LSPS2ServiceConfig,
+	) {
+		let channels = self.channel_manager.list_channels_with_counterparty(their_network_key);
+		// A buy stays listed while the channel opened for it is pending.
+		if channels.iter().any(|channel| channel.user_channel_id == buy.user_channel_id) {
+			return;
+		}
+
+		let peer_manager =
+			self.peer_manager.read().expect("lock").as_ref().and_then(|weak| weak.upgrade());
+		let Some(peer_manager) = peer_manager else {
+			debug_assert!(false, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
+			log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
+			return;
+		};
+
+		// Fail if we're not connected to the prospective channel partner.
+		let Some(peer) = peer_manager.peer_by_node_id(their_network_key) else {
+			log_error!(
+				self.logger,
+				"Failed to provide LSPS2 liquidity to {} due to peer not being connected.",
+				their_network_key,
+			);
+			// TODO: We fail the payment back here. Eventually we will need to remember
+			// the pending requests and regularly retry opening the channel until we
+			// succeed.
+			self.fail_channel_open(their_network_key, buy.user_channel_id).await;
+			return;
+		};
+
+		let client_channels: Vec<ClientChannel> = channels.iter().map(client_channel).collect();
+		let plan = plan_jit_liquidity(
+			peer.init_features.supports_splicing(),
+			service_config.client_trusts_lsp,
+			buy.amt_to_forward_msat,
+			&client_channels,
+		);
+		log_debug!(
+			self.logger,
+			"Providing LSPS2 liquidity for buy {} of {}: {:?}",
+			buy.user_channel_id,
+			their_network_key,
+			plan,
+		);
+		match plan {
+			JitLiquidityPlan::Open(_) => {
+				self.open_jit_channel(
+					*their_network_key,
+					peer.init_features,
+					buy.amt_to_forward_msat,
+					buy.user_channel_id,
+					service_config,
+				)
+				.await
+			},
+			JitLiquidityPlan::Splice(channel_id) => {
+				self.splice_jit_liquidity(their_network_key, &buy, channel_id, service_config).await
+			},
+			// Served again once that channel's `ChannelReady` asks for it.
+			JitLiquidityPlan::WaitFor(_) => {},
+		}
+	}
+
+	async fn open_jit_channel(
+		&self, their_network_key: PublicKey, init_features: InitFeatures, amt_to_forward_msat: u64,
+		user_channel_id: u128, service_config: &LSPS2ServiceConfig,
+	) {
+		// Fail if we have insufficient onchain funds available.
+		let channel_amount_sats =
+			jit_liquidity_sats(amt_to_forward_msat, service_config.channel_over_provisioning_ppm);
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+		let anchor_channel =
+			crate::peer_may_negotiate_anchor_channel_type(&self.config, &init_features);
+		let additional_reserve_required = crate::new_channel_anchor_reserve_sats(
+			&self.config,
+			&their_network_key,
+			anchor_channel,
+		);
+		let required_funds_sats = channel_amount_sats.saturating_add(additional_reserve_required);
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, required_funds_sats,
+			);
+			// TODO: We fail the payment back here. Eventually we will need to remember
+			// the pending requests and regularly retry opening the channel until we
+			// succeed.
+			self.fail_channel_open(&their_network_key, user_channel_id).await;
+			return;
+		}
+
+		// The funding transaction's fee is paid from the same on-chain funds, so we can't
+		// fund more than we would when opening a channel with all of them.
+		let total_anchor_reserve_sats =
+			cur_anchor_reserve_sats.saturating_add(additional_reserve_required);
+		let funding_fee_rate =
+			self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		let max_amount =
+			match self.wallet.get_max_funding_amount(total_anchor_reserve_sats, funding_fee_rate) {
+				Ok(max_amount) => max_amount,
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"Unable to create channel as the maximum funding amount couldn't be determined: {:?}",
+						e,
+					);
+					self.fail_channel_open(&their_network_key, user_channel_id).await;
+					return;
+				},
+			};
+		if channel_amount_sats > max_amount {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Requested: {}sats, Maximum: {}sats (fee rate: {} sat/kw, anchor reserve: {}sats)",
+				channel_amount_sats, max_amount, funding_fee_rate.to_sat_per_kwu(), total_anchor_reserve_sats,
+			);
+			self.fail_channel_open(&their_network_key, user_channel_id).await;
+			return;
+		}
+
+		let mut config = self.channel_manager.get_current_config().clone();
+
+		// If we act as an LSPS2 service, the HTLC-value-in-flight must be 100% of the
+		// channel value to ensure we can forward the initial payment. That cap only
+		// applies to unannounced channels, so the channel must also be unannounced.
+		debug_assert_eq!(
+			config
+				.channel_handshake_config
+				.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
+			100
+		);
+		debug_assert!(!config.channel_handshake_config.announce_for_forwarding);
+		debug_assert!(config.accept_forwards_to_priv_channels);
+
+		// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
+		//
+		// TODO: revisit this decision eventually.
+		config.channel_config.forwarding_fee_base_msat = 0;
+		config.channel_config.forwarding_fee_proportional_millionths = 0;
+
+		let result = if service_config.disable_client_reserve {
+			self.channel_manager.create_channel_to_trusted_peer_0reserve(
+				their_network_key,
+				channel_amount_sats,
+				0,
+				user_channel_id,
+				None,
+				Some(config),
+			)
+		} else {
+			self.channel_manager.create_channel(
+				their_network_key,
+				channel_amount_sats,
+				0,
+				user_channel_id,
+				None,
+				Some(config),
+			)
+		};
+
+		match result {
+			Ok(_) => {},
+			Err(e) => {
+				let zero_reserve_string =
+					if service_config.disable_client_reserve { "0reserve " } else { "" };
+				log_error!(
+					self.logger,
+					"Failed to open LSPS2 {}channel to {}: {:?}",
+					zero_reserve_string,
+					their_network_key,
+					e
+				);
+				// TODO: We fail the payment back here. Eventually we will need to remember
+				// the pending requests and regularly retry opening the channel until we
+				// succeed.
+				self.fail_channel_open(&their_network_key, user_channel_id).await;
+			},
+		}
+	}
+
+	/// Splices the liquidity for `buy` into `channel_id`, binding the buy to the splice first.
+	async fn splice_jit_liquidity(
+		&self, their_network_key: &PublicKey, buy: &BuyAwaitingChannel, channel_id: ChannelId,
+		service_config: &LSPS2ServiceConfig,
+	) {
+		let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() else {
+			return;
+		};
+		if let Err(e) = lsps2_service_handler
+			.splice_initiated(their_network_key, buy.user_channel_id, &channel_id)
+			.await
+		{
+			// The buy stays listed, to be served once the channel is free.
+			log_info!(
+				self.logger,
+				"Deferring LSPS2 buy {} as channel {} can't be spliced for it yet: {:?}",
+				buy.user_channel_id,
+				channel_id,
+				e,
+			);
+			return;
+		}
+
+		let splice_amount_sats = jit_liquidity_sats(
+			buy.amt_to_forward_msat,
+			service_config.channel_over_provisioning_ppm,
+		);
+		if self.initiate_splice(their_network_key, &channel_id, splice_amount_sats).await.is_err() {
+			if let Err(e) =
+				lsps2_service_handler.splice_abandoned(their_network_key, &channel_id).await
+			{
+				log_error!(
+					self.logger,
+					"Failed to unbind LSPS2 buy {} from channel {}: {:?}",
+					buy.user_channel_id,
+					channel_id,
+					e,
+				);
+			}
+			// TODO: As for a failed open, we fail the payment back here.
+			self.fail_channel_open(their_network_key, buy.user_channel_id).await;
+			return;
+		}
+		log_info!(
+			self.logger,
+			"Splicing {}sats into channel {} for LSPS2 buy {}",
+			splice_amount_sats,
+			channel_id,
+			buy.user_channel_id,
+		);
+	}
+
+	async fn initiate_splice(
+		&self, their_network_key: &PublicKey, channel_id: &ChannelId, splice_amount_sats: u64,
+	) -> Result<(), ()> {
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+		if spendable_amount_sats < splice_amount_sats {
+			log_error!(
+				self.logger,
+				"Unable to splice due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats,
+				splice_amount_sats,
+			);
+			return Err(());
+		}
+
+		let funding_template =
+			self.channel_manager.splice_channel(channel_id, their_network_key).map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel {}: {:?}", channel_id, e);
+			})?;
+		if funding_template.prior_contribution().is_some() {
+			log_error!(
+				self.logger,
+				"Failed to splice channel {}: a prior splice contribution is pending",
+				channel_id,
+			);
+			return Err(());
+		}
+
+		let min_feerate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		let max_feerate = max_funding_feerate(min_feerate);
+		// Contributing to a pending splice takes at least its RBF feerate, if within our maximum.
+		let feerate = match funding_template.min_rbf_feerate() {
+			Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+				min_feerate.max(min_rbf_feerate)
+			},
+			_ => min_feerate,
+		};
+		let contribution = funding_template
+			.splice_in(
+				Amount::from_sat(splice_amount_sats),
+				feerate,
+				max_feerate,
+				Arc::clone(&self.wallet),
+			)
+			.await
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel {}: {}", channel_id, e);
+			})?;
+		self.channel_manager
+			.funding_contributed(channel_id, their_network_key, contribution, None)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel {}: {:?}", channel_id, e);
+			})
+	}
+}
+
+/// The liquidity provided for a buy forwarding `amt_to_forward_msat`: the amount plus the
+/// over-provisioning, in satoshis.
+fn jit_liquidity_sats(amt_to_forward_msat: u64, over_provisioning_ppm: u32) -> u64 {
+	let over_provisioning_msat =
+		amt_to_forward_msat.saturating_mul(over_provisioning_ppm as u64) / 1_000_000;
+	amt_to_forward_msat.saturating_add(over_provisioning_msat) / 1000
+}
+
+fn client_channel(details: &ChannelDetails) -> ClientChannel {
+	let shutting_down = details
+		.channel_shutdown_state
+		.is_some_and(|state| state != ChannelShutdownState::NotShuttingDown);
+	let outbound_htlcs_msat =
+		details.pending_outbound_htlcs.iter().map(|htlc| htlc.amount_msat).sum();
+	ClientChannel {
+		channel_id: details.channel_id,
+		channel_value_sats: details.channel_value_satoshis,
+		state: client_channel_state(
+			details.is_channel_ready,
+			shutting_down,
+			details.counterparty.outbound_htlc_maximum_msat,
+			outbound_htlcs_msat,
+		),
+	}
+}
+
+/// Where a channel stands for splicing, from LDK's view of it.
+///
+/// A ready channel is usable whether or not its peer is connected: LDK splices a channel that is
+/// ready and not shutting down, and holds the splice until the peer reestablishes it.
+fn client_channel_state(
+	is_channel_ready: bool, shutting_down: bool, outbound_htlc_maximum_msat: Option<u64>,
+	outbound_htlcs_msat: u64,
+) -> ClientChannelState {
+	match (shutting_down, is_channel_ready) {
+		(true, _) => ClientChannelState::ShuttingDown,
+		(false, true) => ClientChannelState::Usable {
+			// LDK learns the maximum when the client accepts the channel, before it is ready.
+			outbound_htlc_maximum_msat: outbound_htlc_maximum_msat.unwrap_or(0),
+			outbound_htlcs_msat,
+		},
+		(false, false) => ClientChannelState::Pending { outbound_htlc_maximum_msat },
 	}
 }
 
 /// How the LSPS2 service provides the liquidity for a buy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Not yet acted on: the `OpenChannel` handler always opens.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum JitLiquidityPlan {
 	/// Open a new channel to the client.
 	Open(OpenReason),
@@ -643,7 +917,6 @@ pub(crate) enum JitLiquidityPlan {
 
 /// Why a buy is served by opening a new channel rather than by a splice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum OpenReason {
 	/// No channel can carry the amount to forward, now or once it is usable. A splice does not
 	/// raise the client's `max_htlc_value_in_flight_msat`, which LDK fixes at the channel's open.
@@ -659,7 +932,6 @@ pub(crate) enum OpenReason {
 
 /// A channel with the client, as far as splicing a buy into it is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ClientChannel {
 	pub(crate) channel_id: ChannelId,
 	pub(crate) channel_value_sats: u64,
@@ -675,15 +947,14 @@ pub(crate) struct ClientChannel {
 ///
 /// [`ChannelCounterparty::outbound_htlc_maximum_msat`]: lightning::ln::channel_state::ChannelCounterparty::outbound_htlc_maximum_msat
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum ClientChannelState {
-	/// The channel is not yet usable, e.g., as its funding awaits `channel_ready` or the peer is
-	/// reestablishing it. The HTLC maximum is known once the client accepted the channel.
+	/// The channel's funding awaits `channel_ready`. The HTLC maximum is known once the client
+	/// accepted the channel.
 	Pending { outbound_htlc_maximum_msat: Option<u64> },
 	/// A `shutdown` was sent or received for the channel.
 	ShuttingDown,
-	/// The channel is usable, with `outbound_htlcs_msat` of HTLCs to the client in flight, which
-	/// count against the same maximum.
+	/// The channel is ready, with `outbound_htlcs_msat` of HTLCs to the client in flight, which
+	/// count against the same maximum. Its peer may be reestablishing it.
 	Usable { outbound_htlc_maximum_msat: u64, outbound_htlcs_msat: u64 },
 }
 
@@ -695,7 +966,6 @@ pub(crate) enum ClientChannelState {
 /// room for the payment and wait for a pending channel that may have room, rather than open a
 /// second channel beside it. Among several, we prefer the largest and then the lowest channel id.
 /// We open a new channel when no channel exists or none can carry the payment.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_jit_liquidity(
 	client_supports_splicing: bool, client_trusts_lsp: bool, amt_to_forward_msat: u64,
 	channels: &[ClientChannel],
@@ -766,6 +1036,40 @@ mod tests {
 
 	fn plan(channels: &[ClientChannel]) -> JitLiquidityPlan {
 		plan_jit_liquidity(true, false, AMOUNT_MSAT, channels)
+	}
+
+	#[test]
+	fn a_channel_shutting_down_is_shutting_down_whatever_else_holds() {
+		for is_channel_ready in [false, true] {
+			let state = client_channel_state(is_channel_ready, true, Some(AMOUNT_MSAT), 0);
+			assert_eq!(state, ClientChannelState::ShuttingDown);
+		}
+	}
+
+	#[test]
+	fn a_ready_channel_is_usable_with_its_htlcs_in_flight() {
+		let state = client_channel_state(true, false, Some(AMOUNT_MSAT), 1_000);
+		assert_eq!(
+			state,
+			ClientChannelState::Usable {
+				outbound_htlc_maximum_msat: AMOUNT_MSAT,
+				outbound_htlcs_msat: 1_000
+			}
+		);
+	}
+
+	#[test]
+	fn a_channel_not_yet_ready_is_pending_with_its_maximum_if_known() {
+		for maximum in [None, Some(AMOUNT_MSAT)] {
+			let state = client_channel_state(false, false, maximum, 0);
+			assert_eq!(state, ClientChannelState::Pending { outbound_htlc_maximum_msat: maximum });
+		}
+	}
+
+	#[test]
+	fn the_liquidity_provided_adds_the_over_provisioning() {
+		assert_eq!(jit_liquidity_sats(100_000_000, 100_000), 110_000);
+		assert_eq!(jit_liquidity_sats(100_000_000, 0), 100_000);
 	}
 
 	#[test]

@@ -1088,6 +1088,22 @@ where
 		funding_candidates(splice_details.as_ref(), counterparty_node_id, channel_id)
 	}
 
+	/// Converts a funding output LDK reported, whose index is therefore a u16.
+	fn ldk_funding_outpoint(&self, txo: OutPoint, channel_id: &ChannelId) -> Option<LdkOutPoint> {
+		match u16::try_from(txo.vout) {
+			Ok(index) => Some(LdkOutPoint { txid: txo.txid, index }),
+			Err(_) => {
+				log_error!(
+					self.logger,
+					"Funding output {} of channel {} has an index LSPS2 can't record",
+					txo,
+					channel_id,
+				);
+				None
+			},
+		}
+	}
+
 	/// The splice rounds LDK tracks for the channel, as [`tracked_splice_rounds`] lists them, or
 	/// `None` once the channel is gone.
 	fn tracked_splice_rounds(
@@ -2567,18 +2583,8 @@ where
 					}
 				}
 
-				let ldk_funding_txo = funding_txo.and_then(|txo| match u16::try_from(txo.vout) {
-					Ok(index) => Some(LdkOutPoint { txid: txo.txid, index }),
-					Err(_) => {
-						log_error!(
-							self.logger,
-							"Funding output {} of channel {} has an index LSPS2 can't record",
-							txo,
-							channel_id,
-						);
-						None
-					},
-				});
+				let ldk_funding_txo =
+					funding_txo.and_then(|txo| self.ldk_funding_outpoint(txo, &channel_id));
 				self.liquidity_source
 					.lsps2_service()
 					.handle_channel_ready(
@@ -2588,6 +2594,9 @@ where
 						ldk_funding_txo,
 					)
 					.await;
+
+				// A buy may have waited for this channel, or for its splice to lock.
+				self.liquidity_source.lsps2_service().request_buys_served(counterparty_node_id);
 
 				let event = Event::ChannelReady {
 					channel_id,
@@ -2712,6 +2721,8 @@ where
 					.lsps2_service()
 					.handle_channel_closed(user_channel_id, channel_id, &counterparty_node_id)
 					.await;
+				// A buy deferred for this channel is planned again without it.
+				self.liquidity_source.lsps2_service().request_buys_served(counterparty_node_id);
 
 				if let Some(peer_info) = peer_to_reconnect {
 					self.remove_peer_after_reconnect(peer_info, channel_id);
@@ -3163,6 +3174,13 @@ where
 					return Err(ReplayEvent());
 				}
 
+				if let Some(txo) = self.ldk_funding_outpoint(new_funding_txo, &channel_id) {
+					self.liquidity_source
+						.lsps2_service()
+						.handle_splice_negotiated(&counterparty_node_id, &channel_id, txo)
+						.await;
+				}
+
 				let event = Event::SpliceNegotiated {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -3216,6 +3234,11 @@ where
 						return Err(ReplayEvent());
 					}
 				}
+
+				self.liquidity_source
+					.lsps2_service()
+					.handle_splice_negotiation_failed(&counterparty_node_id, &channel_id)
+					.await;
 
 				let parameters =
 					contribution.as_ref().map(|c| SpliceParameters::from(c.contribution()));

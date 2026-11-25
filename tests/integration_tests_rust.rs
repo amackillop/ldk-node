@@ -7544,17 +7544,28 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		.unwrap();
 	let variable_amount_msat = 20_000_000;
 	let variable_fee_msat = (variable_amount_msat * channel_opening_fee_ppm as u64) / 1_000_000;
+	let channel_count = client_node.list_channels().len();
 	let variable_payment_id = payer_node
 		.bolt11_payment()
 		.send_using_amount(&variable_invoice, variable_amount_msat, None)
 		.unwrap();
-	expect_channel_pending_event!(service_node, client_node.node_id());
+	// It fits one of the client's channels, so it is spliced into it rather than opening another,
+	// unless the client trusts the LSP, whose funding a splice can't withhold.
+	if client_trusts_lsp {
+		expect_channel_pending_event!(service_node, client_node.node_id());
+	} else {
+		expect_splice_negotiated_event!(service_node, client_node.node_id());
+	}
 	expect_channel_ready_event!(service_node, client_node.node_id());
-	expect_channel_pending_event!(client_node, service_node.node_id());
+	if client_trusts_lsp {
+		expect_channel_pending_event!(client_node, service_node.node_id());
+	}
 	expect_channel_ready_event!(client_node, service_node.node_id());
 	expect_payment_received_event!(client_node, variable_amount_msat - variable_fee_msat);
 	expect_event!(service_node, PaymentForwarded);
 	expect_payment_successful_event!(payer_node, variable_payment_id, None);
+	let new_channels = usize::from(client_trusts_lsp);
+	assert_eq!(client_node.list_channels().len(), channel_count + new_channels);
 
 	// BOLT11 receives are one-off, so none of the above may leave a replacement lease behind.
 	assert!(KVStore::list(&client_store, "lsps2_leases", "").await.unwrap().is_empty());
@@ -8339,10 +8350,44 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
 	client_trusts_0conf: bool,
 ) -> (TestNode, TestNode, TestNode) {
+	setup_lsps2_nodes_with(
+		bitcoind,
+		electrsd,
+		service_store,
+		service_funds_sat,
+		client_trusts_0conf,
+		false,
+	)
+	.await
+}
+
+/// With `spliceable`, the service and client channel use zero-fee commitments and no client
+/// reserve, as an LSP serving buys by splicing them into one channel per client would.
+async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
+	client_trusts_0conf: bool, spliceable: bool,
+) -> (TestNode, TestNode, TestNode) {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let mut sync_config = EsploraSyncConfig::default();
 	sync_config.background_sync_config = None;
+	// Zero-fee commitments need a chain source that submits packages, which the test Esplora lacks.
+	macro_rules! set_chain_source {
+		($builder: ident) => {
+			if spliceable {
+				let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
+				$builder.set_chain_source_bitcoind_rpc(
+					bitcoind.params.rpc_socket.ip().to_string(),
+					bitcoind.params.rpc_socket.port(),
+					cookie.user,
+					cookie.password,
+					None,
+				);
+			} else {
+				$builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+			}
+		};
+	}
 
 	let lsps2_service_config = LSPS2ServiceConfig {
 		require_token: None,
@@ -8355,12 +8400,13 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: false,
-		disable_client_reserve: false,
+		disable_client_reserve: spliceable,
 	};
 
-	let service_config = random_config();
+	let mut service_config = random_config();
+	service_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
 	setup_builder!(service_builder, service_config.node_config);
-	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	set_chain_source!(service_builder);
 	service_builder.enable_liquidity_provider(lsps2_service_config);
 	let service_node = service_builder
 		.build_with_store(service_config.node_entropy.into(), service_store)
@@ -8368,9 +8414,10 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 	service_node.start().unwrap();
 	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
 
-	let client_config = random_config();
+	let mut client_config = random_config();
+	client_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
 	setup_builder!(client_builder, client_config.node_config);
-	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	set_chain_source!(client_builder);
 	client_builder.add_liquidity_source(
 		service_node.node_id(),
 		service_addr,
@@ -8571,6 +8618,155 @@ async fn lsps2_service_fails_payment_if_channel_closes_before_ready() {
 	expect_event!(client_node, ChannelClosed);
 	expect_event!(service_node, ChannelClosed);
 	expect_event!(payer_node, PaymentFailed);
+}
+
+/// Pays a JIT invoice the client issues for `amount_msat`, returning the payer's payment id.
+fn pay_jit_invoice(client_node: &TestNode, payer_node: &TestNode, amount_msat: u64) -> PaymentId {
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("splice")).unwrap());
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(amount_msat, &invoice_description.into(), 1024)
+		.unwrap();
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap()
+}
+
+/// The service's first buy for the client, which opens the client's channel.
+async fn open_first_jit_channel(
+	service_node: &TestNode, client_node: &TestNode, payer_node: &TestNode, amount_msat: u64,
+) {
+	let payer_payment_id = pay_jit_invoice(client_node, payer_node, amount_msat);
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+}
+
+/// The liquidity the service provides for a buy of `amount_msat`: the payment less the 1% fee,
+/// over-provisioned by 10%, in satoshis.
+fn jit_liquidity_sats(amount_msat: u64) -> u64 {
+	amount_msat * 99 / 100 * 110 / 100 / 1000
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_splices_later_buys_into_the_clients_channel() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 10_000_000, true, true).await;
+
+	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
+	let opened_sats = client_node.list_channels().first().unwrap().channel_value_sats;
+
+	// Each later buy is spliced into the one channel, locking with no block mined after it, and
+	// skims its own fee once.
+	let mut channel_sats = opened_sats;
+	for amount_msat in [50_000_000, 20_000_000] {
+		// A splice spends confirmed coins only, and the last funding left the service's unconfirmed.
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		service_node.sync_wallets().unwrap();
+		let payer_payment_id = pay_jit_invoice(&client_node, &payer_node, amount_msat);
+		expect_splice_negotiated_event!(service_node, client_node.node_id());
+		expect_channel_ready_event!(service_node, client_node.node_id());
+		expect_event!(service_node, PaymentForwarded);
+		expect_channel_ready_event!(client_node, service_node.node_id());
+		expect_payment_successful_event!(payer_node, payer_payment_id, None);
+		expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+
+		// LDK leaves a change output that would be dust in the channel.
+		let channels = client_node.list_channels();
+		assert_eq!(channels.len(), 1);
+		let added_sats = channels[0].channel_value_sats - channel_sats;
+		assert!(added_sats >= jit_liquidity_sats(amount_msat), "{}", added_sats);
+		assert!(added_sats < jit_liquidity_sats(amount_msat) + 330, "{}", added_sats);
+		channel_sats = channels[0].channel_value_sats;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_fails_payment_if_it_cannot_fund_a_splice() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// Enough for the first JIT channel, but not for splicing the second buy into it.
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 250_000, true, true).await;
+	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("splice")).unwrap());
+	let jit_amount_msat = 100_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.unwrap();
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_event!(payer_node, PaymentFailed);
+
+	// Once the service can fund the splice, a retry of the payment is spliced in.
+	let service_addr = service_node.onchain_payment().new_address().unwrap();
+	distribute_funds_unconfirmed(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![service_addr],
+		Amount::from_sat(10_000_000),
+	)
+	.await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	service_node.sync_wallets().unwrap();
+
+	let payer_payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_splice_negotiated_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, jit_amount_msat * 99 / 100);
+	assert_eq!(client_node.list_channels().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_forwards_a_spliced_buy_after_restarting_before_the_lock() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// The client doesn't trust the service's unconfirmed funding, so the splice locks only once
+	// it confirms.
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 10_000_000, false, true).await;
+
+	let first_payment_id = pay_jit_invoice(&client_node, &payer_node, 100_000_000);
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, first_payment_id, None);
+	expect_payment_received_event!(client_node, 100_000_000 * 99 / 100);
+
+	let amount_msat = 50_000_000;
+	let payer_payment_id = pay_jit_invoice(&client_node, &payer_node, amount_msat);
+	expect_splice_negotiated_event!(service_node, client_node.node_id());
+
+	// The buy's binding to the splice survives the restart.
+	service_node.stop().unwrap();
+	service_node.start().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	client_node.connect(service_node.node_id(), service_addr, false).unwrap();
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+	assert_eq!(client_node.list_channels().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

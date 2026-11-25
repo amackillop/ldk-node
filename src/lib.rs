@@ -927,6 +927,20 @@ impl Node {
 			}
 		});
 
+		// Kept off the liquidity event loop, whose `select!` would drop an event handled meanwhile.
+		let mut stop_buy_serving = self.stop_sender.subscribe();
+		let lsps2_service = self.liquidity_source.lsps2_service();
+		self.runtime.spawn_cancellable_background_task(async move {
+			loop {
+				tokio::select! {
+					_ = stop_buy_serving.changed() => return,
+					_ = lsps2_service.buys_to_serve_requested() => {
+						lsps2_service.serve_requested_buys().await;
+					}
+				}
+			}
+		});
+
 		if !self.config.disable_lightning_connections {
 			// Retry protocol discovery for any LSPs that failed the startup batch, backing off up to a
 			// cap and then retrying at that cap until every configured LSP has been discovered.
