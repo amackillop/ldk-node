@@ -8356,38 +8356,34 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 		service_store,
 		service_funds_sat,
 		client_trusts_0conf,
-		false,
+		Lsps2Channels::Anchors,
 	)
 	.await
 }
 
-/// With `spliceable`, the service and client channel use zero-fee commitments and no client
-/// reserve, as an LSP serving buys by splicing them into one channel per client would.
+/// The channels an LSPS2 service opens to its client.
+#[derive(Clone, Copy)]
+enum Lsps2Channels {
+	/// Anchor channels with a client reserve, as the service opens by default.
+	Anchors,
+	/// Zero-fee commitment channels with no client reserve, as an LSP serving buys by splicing
+	/// them into one channel per client would. They need a chain source that submits packages,
+	/// which the test Esplora lacks, so both ends sync from bitcoind RPC.
+	#[cfg(feature = "chain-bitcoind")]
+	Spliceable,
+}
+
+/// Like [`setup_lsps2_nodes`], with the service opening `channels` to the client.
 async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
-	client_trusts_0conf: bool, spliceable: bool,
+	client_trusts_0conf: bool, channels: Lsps2Channels,
 ) -> (TestNode, TestNode, TestNode) {
-	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
-
-	let mut sync_config = EsploraSyncConfig::default();
-	sync_config.background_sync_config = None;
-	// Zero-fee commitments need a chain source that submits packages, which the test Esplora lacks.
-	macro_rules! set_chain_source {
-		($builder: ident) => {
-			if spliceable {
-				let cookie = bitcoind.params.get_cookie_values().unwrap().unwrap();
-				$builder.set_chain_source_bitcoind_rpc(
-					bitcoind.params.rpc_socket.ip().to_string(),
-					bitcoind.params.rpc_socket.port(),
-					cookie.user,
-					cookie.password,
-					None,
-				);
-			} else {
-				$builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-			}
-		};
-	}
+	let spliceable = !matches!(channels, Lsps2Channels::Anchors);
+	let chain_source = match channels {
+		Lsps2Channels::Anchors => TestChainSource::Esplora(electrsd),
+		#[cfg(feature = "chain-bitcoind")]
+		Lsps2Channels::Spliceable => TestChainSource::BitcoindRpcSync(bitcoind),
+	};
 
 	let lsps2_service_config = LSPS2ServiceConfig {
 		require_token: None,
@@ -8406,7 +8402,7 @@ async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	let mut service_config = random_config();
 	service_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
 	setup_builder!(service_builder, service_config.node_config);
-	set_chain_source!(service_builder);
+	configure_chain_source(&chain_source, &mut service_builder, &service_config);
 	service_builder.enable_liquidity_provider(lsps2_service_config);
 	let service_node = service_builder
 		.build_with_store(service_config.node_entropy.into(), service_store)
@@ -8417,7 +8413,7 @@ async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 	let mut client_config = random_config();
 	client_config.node_config.anchor_channels_config.enable_zero_fee_commitments |= spliceable;
 	setup_builder!(client_builder, client_config.node_config);
-	set_chain_source!(client_builder);
+	configure_chain_source(&chain_source, &mut client_builder, &client_config);
 	client_builder.add_liquidity_source(
 		service_node.node_id(),
 		service_addr,
@@ -8429,7 +8425,7 @@ async fn setup_lsps2_nodes_with<S: PaginatedKVStore + Send + Sync + 'static>(
 
 	let payer_config = random_config();
 	setup_builder!(payer_builder, payer_config.node_config);
-	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	configure_chain_source(&TestChainSource::Esplora(electrsd), &mut payer_builder, &payer_config);
 	let payer_node = payer_builder.build(payer_config.node_entropy.into()).unwrap();
 	payer_node.start().unwrap();
 
@@ -8621,6 +8617,7 @@ async fn lsps2_service_fails_payment_if_channel_closes_before_ready() {
 }
 
 /// Pays a JIT invoice the client issues for `amount_msat`, returning the payer's payment id.
+#[cfg(feature = "chain-bitcoind")]
 fn pay_jit_invoice(client_node: &TestNode, payer_node: &TestNode, amount_msat: u64) -> PaymentId {
 	let invoice_description =
 		Bolt11InvoiceDescription::Direct(Description::new(String::from("splice")).unwrap());
@@ -8632,6 +8629,7 @@ fn pay_jit_invoice(client_node: &TestNode, payer_node: &TestNode, amount_msat: u
 }
 
 /// The service's first buy for the client, which opens the client's channel.
+#[cfg(feature = "chain-bitcoind")]
 async fn open_first_jit_channel(
 	service_node: &TestNode, client_node: &TestNode, payer_node: &TestNode, amount_msat: u64,
 ) {
@@ -8647,16 +8645,25 @@ async fn open_first_jit_channel(
 
 /// The liquidity the service provides for a buy of `amount_msat`: the payment less the 1% fee,
 /// over-provisioned by 10%, in satoshis.
+#[cfg(feature = "chain-bitcoind")]
 fn jit_liquidity_sats(amount_msat: u64) -> u64 {
 	amount_msat * 99 / 100 * 110 / 100 / 1000
 }
 
+#[cfg(feature = "chain-bitcoind")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_splices_later_buys_into_the_clients_channel() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
-	let (service_node, client_node, payer_node) =
-		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 10_000_000, true, true).await;
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		true,
+		Lsps2Channels::Spliceable,
+	)
+	.await;
 
 	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
 	let opened_sats = client_node.list_channels().first().unwrap().channel_value_sats;
@@ -8686,13 +8693,21 @@ async fn lsps2_service_splices_later_buys_into_the_clients_channel() {
 	}
 }
 
+#[cfg(feature = "chain-bitcoind")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_fails_payment_if_it_cannot_fund_a_splice() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	// Enough for the first JIT channel, but not for splicing the second buy into it.
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
-	let (service_node, client_node, payer_node) =
-		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 250_000, true, true).await;
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		250_000,
+		true,
+		Lsps2Channels::Spliceable,
+	)
+	.await;
 	open_first_jit_channel(&service_node, &client_node, &payer_node, 100_000_000).await;
 
 	let invoice_description =
@@ -8727,14 +8742,22 @@ async fn lsps2_service_fails_payment_if_it_cannot_fund_a_splice() {
 	assert_eq!(client_node.list_channels().len(), 1);
 }
 
+#[cfg(feature = "chain-bitcoind")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_forwards_a_spliced_buy_after_restarting_before_the_lock() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	// The client doesn't trust the service's unconfirmed funding, so the splice locks only once
 	// it confirms.
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
-	let (service_node, client_node, payer_node) =
-		setup_lsps2_nodes_with(&bitcoind, &electrsd, service_store, 10_000_000, false, true).await;
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		false,
+		Lsps2Channels::Spliceable,
+	)
+	.await;
 
 	let first_payment_id = pay_jit_invoice(&client_node, &payer_node, 100_000_000);
 	expect_channel_pending_event!(service_node, client_node.node_id());
