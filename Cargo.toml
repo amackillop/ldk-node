@@ -86,18 +86,18 @@ uniffi-default = [
 #lightning-macros = { version = "0.2.0" }
 #lightning-dns-resolver = { version = "0.3.0" }
 
-lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["std"] }
-lightning-types = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-invoice = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["std"] }
-lightning-net-tokio = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-persister = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["tokio"], optional = true }
-lightning-background-processor = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-rapid-gossip-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-block-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["rest-client", "rpc-client", "tokio"], optional = true }
-lightning-transaction-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", optional = true }
-lightning-liquidity = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["std"] }
-lightning-macros = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-dns-resolver = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", optional = true }
+lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["std"] }
+lightning-types = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-invoice = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["std"] }
+lightning-net-tokio = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-persister = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["tokio"], optional = true }
+lightning-background-processor = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-rapid-gossip-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-block-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["rest-client", "rpc-client", "tokio"], optional = true }
+lightning-transaction-sync = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", optional = true }
+lightning-liquidity = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["std"] }
+lightning-macros = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-dns-resolver = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", optional = true }
 
 bdk_chain = { version = "0.23.3", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.2", default-features = false, features = ["async-https-rustls", "tokio"], optional = true }
@@ -139,8 +139,8 @@ bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-
 winapi = { version = "0.3", features = ["winbase"] }
 
 [dev-dependencies]
-lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["std", "_test_utils"] }
-lightning-persister = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96", features = ["tokio"] }
+lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["std", "_test_utils"] }
+lightning-persister = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a", features = ["tokio"] }
 rand = { version = "0.9.2", default-features = false, features = ["std", "thread_rng", "os_rng"] }
 proptest = "1.0.0"
 regex = "1.5.6"
@@ -252,5 +252,5 @@ harness = false
 # bitcoin-payment-instructions depends on upstream rust-lightning itself. A crate that builds LDK
 # Node with unified-payments needs this patch too.
 [patch."https://github.com/lightningdevkit/rust-lightning"]
-lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
-lightning-invoice = { git = "https://github.com/amackillop/rust-lightning", rev = "9080ec8ed194b0f99412b64affb9b96016489b96" }
+lightning = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
+lightning-invoice = { git = "https://github.com/amackillop/rust-lightning", rev = "63710873e9512b72ba2686acc49a7af18f99ee3a" }
